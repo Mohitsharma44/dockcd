@@ -1,0 +1,11 @@
+repo: git@github.com:user/infra.git
+base_path: /opt/stacks
+hosts:
+  server01:
+    stacks:
+      - name: monitoring
+        path: monitoring/
+      - name: app
+        path: app/
+        depends_on: [monitoring]
+        post_deploy_delay: 30s
