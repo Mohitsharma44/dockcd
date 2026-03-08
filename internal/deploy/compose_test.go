@@ -44,3 +44,33 @@ func TestDeployRunsComposeUp(t *testing.T) {
 		t.Errorf("expected 'docker compose up', got %v", ranCommands)
 	}
 }
+
+func TestDeployRejectsAbsolutePath(t *testing.T) {
+	fakeRunner := func(ctx context.Context, dir string, name string, args ...string) error {
+		return nil
+	}
+
+	stack := Stack{Name: "evil", Path: "/etc/something"}
+	err := Deploy(context.Background(), stack, "/opt/repo", fakeRunner)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "must be relative") {
+		t.Fatalf("expected 'must be relative' error, got %v", err)
+	}
+}
+
+func TestDeployRejectsPathTraversal(t *testing.T) {
+	fakeRunner := func(ctx context.Context, dir string, name string, args ...string) error {
+		return nil
+	}
+
+	stack := Stack{Name: "evil", Path: "../../etc/something"}
+	err := Deploy(context.Background(), stack, "/opt/repo", fakeRunner)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "escapes repo") {
+		t.Fatalf("expected 'escapes repo' error, got %v", err)
+	}
+}
