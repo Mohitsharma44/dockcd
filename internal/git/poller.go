@@ -12,6 +12,7 @@ type Poller struct {
 	localDir  string
 	lastHash  string
 	stateFile string
+	branch    string
 }
 
 func NewPoller(repoURL, localDir string) *Poller {
@@ -27,9 +28,20 @@ func (p *Poller) Clone() error {
 		return fmt.Errorf("git clone: %w\n%s", err, out)
 	}
 
-	cmd = exec.Command("git", "rev-parse", "HEAD")
+	// Detect the default branch name from the remote
+	cmd = exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
 	cmd.Dir = p.localDir
 	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("detecting default branch: %w", err)
+	}
+	// output is like "refs/remotes/origin/main" — extract branch name
+	ref := strings.TrimSpace(string(out))
+	p.branch = strings.TrimPrefix(ref, "refs/remotes/origin/")
+
+	cmd = exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = p.localDir
+	out, err = cmd.Output()
 	if err != nil {
 		return fmt.Errorf("git rev-parse HEAD after clone: %w", err)
 	}
@@ -79,7 +91,7 @@ func (p *Poller) Fetch() (bool, error) {
 		return false, fmt.Errorf("git fetch: %w\n%s", err, out)
 	}
 
-	cmd = exec.Command("git", "rev-parse", "origin/main")
+	cmd = exec.Command("git", "rev-parse", "origin/"+p.branch)
 	cmd.Dir = p.localDir
 	out, err = cmd.Output()
 	if err != nil {
