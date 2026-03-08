@@ -5,11 +5,12 @@ import "fmt"
 // ErrCycleDetected is returned when stacks have circular dependencies.
 var ErrCycleDetected = fmt.Errorf("dependency cycle detected")
 
-// Stack represents a deployable unit with optional dependencies.
+// Stack is a minimal graph input type, intentionally decoupled from
+// configuration schema types (e.g., internal/config.Stack).
 type Stack struct {
-	Name      string   `yaml:"name"`
-	Path      string   `yaml:"path"`
-	DependsOn []string `yaml:"depends_on"`
+	Name      string
+	Path      string
+	DependsOn []string
 }
 
 // BuildGraph takes a list of stacks and returns parallel deployment groups
@@ -28,15 +29,21 @@ func BuildGraph(stacks []Stack) ([][]Stack, error) {
 
 	// Map of stack of dependents
 	dependents := make(map[string][]string)
-	for _, st := range stacks {
-		for _, dep := range st.DependsOn {
-			dependents[dep] = append(dependents[dep], st.Name)
+	for _, stack := range stacks {
+		for _, dep := range stack.DependsOn {
+			if _, exists := waitCount[dep]; !exists {
+				return nil, fmt.Errorf("stack %q depends on unknown stack %q", stack.Name, dep)
+			}
+			dependents[dep] = append(dependents[dep], stack.Name)
 		}
 	}
 
 	stackByName := make(map[string]Stack, len(stacks))
-	for _, st := range stacks {
-		stackByName[st.Name] = st
+	for _, stack := range stacks {
+		if _, exists := stackByName[stack.Name]; exists {
+			return nil, fmt.Errorf("duplicate stack name: %s", stack.Name)
+		}
+		stackByName[stack.Name] = stack
 	}
 
 	// Seed queue with stacks that have no dependencies

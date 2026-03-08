@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -21,6 +22,35 @@ func TestBuildGraphSingleStack(t *testing.T) {
 		t.Fatalf("expected 1 stack in group, got %d", len(groups[0]))
 	}
 	assertGroupNames(t, groups[0], []string{"web"})
+}
+
+func TestBuildGraphUnknownDependency(t *testing.T) {
+	stacks := []Stack{
+		{Name: "app", Path: "app/", DependsOn: []string{"ghost"}},
+	}
+
+	_, err := BuildGraph(stacks)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown stack") {
+		t.Fatalf("expected unknown stack error, got %v", err)
+	}
+}
+
+func TestBuildGraphDuplicateName(t *testing.T) {
+	stacks := []Stack{
+		{Name: "app", Path: "app/"},
+		{Name: "app", Path: "app2/"},
+	}
+
+	_, err := BuildGraph(stacks)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "duplicate stack name") {
+		t.Fatalf("expected duplicate name error, got %v", err)
+	}
 }
 
 func TestBuildGraphLinearChain(t *testing.T) {
@@ -58,14 +88,12 @@ func TestBuildGraphParallelBranches(t *testing.T) {
 	if len(groups) != 1 {
 		t.Fatalf("expected 1 group, got %d", len(groups))
 	}
-	if len(groups[0]) != 3 {
-		t.Fatalf("expected 3 stacks in group, got %d", len(groups[0]))
-	}
+	assertGroupNames(t, groups[0], []string{"web", "db", "cache"})
 }
 
 func TestBuildGraphDiamond(t *testing.T) {
-	// a → b, a → c, b → d, c → d
-	// Groups: [a], [b, c], [d]
+	// d → b, d → c, b → a, c → a
+	// Groups: [d], [b, c], [a]
 	stacks := []Stack{
 		{Name: "a", Path: "a/", DependsOn: []string{"b", "c"}},
 		{Name: "b", Path: "b/", DependsOn: []string{"d"}},
