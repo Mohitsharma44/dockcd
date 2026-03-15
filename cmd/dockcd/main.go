@@ -8,10 +8,11 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
-	"syscall"
-
 	"strconv"
+	"syscall"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -21,7 +22,9 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/mohitsharma44/dockcd/internal/config"
+	"github.com/mohitsharma44/dockcd/internal/git"
 	"github.com/mohitsharma44/dockcd/internal/metrics"
+	"github.com/mohitsharma44/dockcd/internal/reconciler"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
 
@@ -81,11 +84,26 @@ func setupTracing(ctx context.Context, logger *slog.Logger) (tracerShutdown, err
 	return tp, nil
 }
 
+// execCommand runs a shell command in the given directory.
+// Used as the production deploy.CommandRunner.
+func execCommand(ctx context.Context, dir string, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %v: %w\n%s", name, args, err, out)
+	}
+	return nil
+}
+
 func main() {
 	configPath := flag.String("config", "gitops.yaml", "path to gitops config file")
 	host := flag.String("host", "", "host name (overrides DOCKCD_HOST env and hostname)")
 	logFormat := flag.String("log-format", "text", "log format: text or json")
 	metricsPort := flag.Int("metrics-port", 0, "port for metrics and health HTTP server (default 9092, or DOCKCD_METRICS_PORT)")
+	repoDir := flag.String("repo-dir", "", "local git clone path (default /opt/dockcd/repo, or DOCKCD_REPO_DIR)")
+	pollInterval := flag.Duration("poll-interval", 0, "git poll interval (default 30s, or DOCKCD_POLL_INTERVAL)")
+	initialSync := flag.Bool("initial-sync", false, "deploy all stacks on first run (or DOCKCD_INITIAL_SYNC=true)")
 	flag.Parse()
 
 	// Resolve metrics port: flag > env var > default 9092.
@@ -100,6 +118,34 @@ func main() {
 		} else {
 			*metricsPort = 9092
 		}
+	}
+
+	// Resolve repo dir: flag > env var > default.
+	if *repoDir == "" {
+		if envDir := os.Getenv("DOCKCD_REPO_DIR"); envDir != "" {
+			*repoDir = envDir
+		} else {
+			*repoDir = "/opt/dockcd/repo"
+		}
+	}
+
+	// Resolve poll interval: flag > env var > default 30s.
+	if *pollInterval == 0 {
+		if envInterval := os.Getenv("DOCKCD_POLL_INTERVAL"); envInterval != "" {
+			d, err := time.ParseDuration(envInterval)
+			if err != nil {
+				slog.Error("invalid DOCKCD_POLL_INTERVAL", "value", envInterval, "error", err)
+				os.Exit(1)
+			}
+			*pollInterval = d
+		} else {
+			*pollInterval = 30 * time.Second
+		}
+	}
+
+	// Resolve initial sync: flag > env var.
+	if !*initialSync {
+		*initialSync = os.Getenv("DOCKCD_INITIAL_SYNC") == "true"
 	}
 
 	// Setup logger
@@ -152,7 +198,6 @@ func main() {
 		logger.Error("failed to create metrics", "error", err)
 		os.Exit(1)
 	}
-	_ = m // will be passed to poller/runner in later phases
 
 	// Setup tracing — exports spans via OTLP gRPC if DOCKCD_OTEL_ENDPOINT is set.
 	// If unset, tracing is a no-op (zero overhead).
@@ -165,6 +210,24 @@ func main() {
 	// Setup HTTP server for /metrics and /healthz.
 	status := &server.Status{}
 	srv := server.New(fmt.Sprintf(":%d", *metricsPort), status, logger)
+
+	// Create git poller and reconciler.
+	poller := git.NewPoller(cfg.Repo, *repoDir)
+	poller.SetStateFile(*repoDir + "/.dockcd_state")
+
+	rec := reconciler.New(reconciler.Config{
+		Poller:       poller,
+		HostStacks:   hostCfg.Stacks,
+		Hostname:     hostname,
+		BasePath:     cfg.BasePath,
+		RepoDir:      *repoDir,
+		PollInterval: *pollInterval,
+		InitialSync:  *initialSync,
+		Runner:       execCommand,
+		Metrics:      m,
+		Status:       status,
+		Logger:       logger,
+	})
 
 	// Start HTTP server in a goroutine (non-blocking).
 	go func() {
@@ -182,10 +245,14 @@ func main() {
 		"host", hostname,
 		"repo", cfg.Repo,
 		"stacks", len(hostCfg.Stacks),
+		"poll_interval", *pollInterval,
+		"initial_sync", *initialSync,
 	)
 
-	// Wait for shutdown signal
-	<-ctx.Done()
+	// Run the reconcile loop — blocks until context is cancelled.
+	if err := rec.Run(ctx); err != nil {
+		logger.Error("reconciler failed", "error", err)
+	}
 	logger.Info("shutting down")
 
 	// Graceful shutdown: stop HTTP server, then flush metrics.

@@ -35,8 +35,8 @@ type healthResponse struct {
 	Commit   string `json:"commit"`
 }
 
-// snapshot reads the current status under a read lock.
-func (s *Status) snapshot() (time.Time, string) {
+// Snapshot reads the current status under a read lock.
+func (s *Status) Snapshot() (time.Time, string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lastSync, s.commit
@@ -93,7 +93,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 // handleHealthz returns JSON with the current status.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	lastSync, commit := s.status.snapshot()
+	lastSync, commit := s.status.Snapshot()
 
 	resp := healthResponse{
 		Status: "ok",
