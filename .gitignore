@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Planning docs (local only)
+PLAN.md
+
+# Build artifacts (binary at repo root)
+/dockcd
+
+# Embedding cache
+.fastembed_cache/
