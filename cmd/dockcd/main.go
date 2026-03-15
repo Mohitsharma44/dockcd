@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -213,9 +214,9 @@ func main() {
 
 	// Create git poller and reconciler.
 	poller := git.NewPoller(cfg.Repo, *repoDir)
-	poller.SetStateFile(*repoDir + "/.dockcd_state")
+	poller.SetStateFile(filepath.Join(*repoDir, ".dockcd_state"))
 
-	rec := reconciler.New(reconciler.Config{
+	rec, err := reconciler.New(reconciler.Config{
 		Poller:       poller,
 		HostStacks:   hostCfg.Stacks,
 		Hostname:     hostname,
@@ -228,6 +229,10 @@ func main() {
 		Status:       status,
 		Logger:       logger,
 	})
+	if err != nil {
+		logger.Error("failed to create reconciler", "error", err)
+		os.Exit(1)
+	}
 
 	// Start HTTP server in a goroutine (non-blocking).
 	go func() {
@@ -252,6 +257,8 @@ func main() {
 	// Run the reconcile loop — blocks until context is cancelled.
 	if err := rec.Run(ctx); err != nil {
 		logger.Error("reconciler failed", "error", err)
+		// Non-zero exit so systemd/k8s can detect the failure.
+		defer os.Exit(1)
 	}
 	logger.Info("shutting down")
 

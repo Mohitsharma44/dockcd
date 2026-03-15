@@ -58,8 +58,22 @@ type Reconciler struct {
 	logger       *slog.Logger
 }
 
-// New creates a Reconciler from the given config.
-func New(cfg Config) *Reconciler {
+// New creates a Reconciler from the given config. Returns an error if
+// required dependencies (Poller, Runner, Status) are missing.
+func New(cfg Config) (*Reconciler, error) {
+	if cfg.Poller == nil {
+		return nil, fmt.Errorf("Poller is required")
+	}
+	if cfg.Runner == nil {
+		return nil, fmt.Errorf("Runner is required")
+	}
+	if cfg.Status == nil {
+		return nil, fmt.Errorf("Status is required")
+	}
+	if cfg.PollInterval <= 0 {
+		return nil, fmt.Errorf("PollInterval must be positive, got %v", cfg.PollInterval)
+	}
+
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -76,7 +90,7 @@ func New(cfg Config) *Reconciler {
 		metrics:      cfg.Metrics,
 		status:       cfg.Status,
 		logger:       logger,
-	}
+	}, nil
 }
 
 // Run starts the reconcile loop. It clones the repo (or loads state if
@@ -116,9 +130,13 @@ func (r *Reconciler) Run(ctx context.Context) error {
 // initRepo clones the repo if it doesn't exist, or loads saved state
 // if the clone is already present (e.g. after a restart).
 func (r *Reconciler) initRepo() error {
-	if _, err := os.Stat(r.repoDir); err == nil {
+	_, err := os.Stat(r.repoDir)
+	if err == nil {
 		r.logger.Info("repo already cloned, loading state")
 		return r.poller.LoadState()
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("checking repo dir: %w", err)
 	}
 	r.logger.Info("cloning repository")
 	return r.poller.Clone()

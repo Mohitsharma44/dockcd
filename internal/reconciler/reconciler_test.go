@@ -69,9 +69,13 @@ func mockRunner(mu *sync.Mutex, calls *[]deployCall) func(ctx context.Context, d
 
 // --- Helper to create a Reconciler for tests ---
 
-func testReconciler(poller *mockPoller, stacks []config.Stack, runner func(ctx context.Context, dir, name string, args ...string) error) (*Reconciler, *server.Status) {
+func testReconciler(t *testing.T, poller *mockPoller, stacks []config.Stack, runner func(ctx context.Context, dir, name string, args ...string) error) (*Reconciler, *server.Status) {
+	t.Helper()
+	if runner == nil {
+		runner = func(ctx context.Context, dir, name string, args ...string) error { return nil }
+	}
 	status := &server.Status{}
-	r := New(Config{
+	r, err := New(Config{
 		Poller:       poller,
 		HostStacks:   stacks,
 		Hostname:     "test-host",
@@ -81,14 +85,49 @@ func testReconciler(poller *mockPoller, stacks []config.Stack, runner func(ctx c
 		Runner:       runner,
 		Status:       status,
 	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
 	return r, status
 }
 
 // --- Tests ---
 
+func TestNewValidatesRequiredDeps(t *testing.T) {
+	_, err := New(Config{})
+	if err == nil {
+		t.Fatal("expected error for missing Poller")
+	}
+
+	_, err = New(Config{
+		Poller: &mockPoller{},
+	})
+	if err == nil {
+		t.Fatal("expected error for missing Runner")
+	}
+
+	_, err = New(Config{
+		Poller: &mockPoller{},
+		Runner: func(ctx context.Context, dir, name string, args ...string) error { return nil },
+	})
+	if err == nil {
+		t.Fatal("expected error for missing Status")
+	}
+
+	_, err = New(Config{
+		Poller:       &mockPoller{},
+		Runner:       func(ctx context.Context, dir, name string, args ...string) error { return nil },
+		Status:       &server.Status{},
+		PollInterval: 0,
+	})
+	if err == nil {
+		t.Fatal("expected error for zero PollInterval")
+	}
+}
+
 func TestInitRepoClones(t *testing.T) {
 	poller := &mockPoller{lastHash: "abc123"}
-	r, _ := testReconciler(poller, nil, nil)
+	r, _ := testReconciler(t, poller,nil, nil)
 	// Use a temp dir that doesn't exist to trigger clone.
 	r.repoDir = "/tmp/dockcd-test-nonexistent-" + t.Name()
 
@@ -102,7 +141,7 @@ func TestInitRepoClones(t *testing.T) {
 
 func TestInitRepoLoadsState(t *testing.T) {
 	poller := &mockPoller{lastHash: "abc123"}
-	r, _ := testReconciler(poller, nil, nil)
+	r, _ := testReconciler(t, poller,nil, nil)
 
 	// Use a temp dir that exists to trigger LoadState.
 	dir := t.TempDir()
@@ -123,7 +162,7 @@ func TestReconcileNoChanges(t *testing.T) {
 	poller := &mockPoller{fetchChanged: false, lastHash: "abc123"}
 	var mu sync.Mutex
 	var calls []deployCall
-	r, _ := testReconciler(poller, nil, mockRunner(&mu, &calls))
+	r, _ := testReconciler(t, poller,nil, mockRunner(&mu, &calls))
 
 	if err := r.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
@@ -147,7 +186,7 @@ func TestReconcileDeploysChangedStacks(t *testing.T) {
 
 	var mu sync.Mutex
 	var calls []deployCall
-	r, status := testReconciler(poller, stacks, mockRunner(&mu, &calls))
+	r, status := testReconciler(t, poller,stacks, mockRunner(&mu, &calls))
 
 	if err := r.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
@@ -180,7 +219,7 @@ func TestReconcileOnlyDeploysChangedStacks(t *testing.T) {
 
 	var mu sync.Mutex
 	var calls []deployCall
-	r, _ := testReconciler(poller, stacks, mockRunner(&mu, &calls))
+	r, _ := testReconciler(t, poller,stacks, mockRunner(&mu, &calls))
 
 	if err := r.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
@@ -213,7 +252,7 @@ func TestReconcileStripsDepsNotInChangedSet(t *testing.T) {
 		changedStacks: []string{"vault"},
 	}
 
-	r, _ := testReconciler(poller, stacks, func(ctx context.Context, dir, name string, args ...string) error {
+	r, _ := testReconciler(t, poller,stacks, func(ctx context.Context, dir, name string, args ...string) error {
 		return nil
 	})
 
@@ -232,7 +271,7 @@ func TestReconcileFetchError(t *testing.T) {
 		lastHash: "abc123",
 	}
 
-	r, _ := testReconciler(poller, nil, nil)
+	r, _ := testReconciler(t, poller,nil, nil)
 
 	err := r.reconcile(context.Background())
 	if err == nil {
@@ -254,7 +293,7 @@ func TestReconcileNoAffectedStacks(t *testing.T) {
 
 	var mu sync.Mutex
 	var calls []deployCall
-	r, _ := testReconciler(poller, stacks, mockRunner(&mu, &calls))
+	r, _ := testReconciler(t, poller,stacks, mockRunner(&mu, &calls))
 
 	if err := r.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
@@ -273,7 +312,7 @@ func TestDeployAllDeploysEverything(t *testing.T) {
 
 	var mu sync.Mutex
 	var calls []deployCall
-	r, _ := testReconciler(&mockPoller{lastHash: "abc"}, stacks, mockRunner(&mu, &calls))
+	r, _ := testReconciler(t, &mockPoller{lastHash: "abc"}, stacks, mockRunner(&mu, &calls))
 
 	if err := r.deployAll(context.Background()); err != nil {
 		t.Fatalf("deployAll failed: %v", err)
@@ -291,7 +330,7 @@ func TestBuildStackPaths(t *testing.T) {
 		{Name: "vault", Path: "server04/vault"},
 	}
 
-	r, _ := testReconciler(&mockPoller{}, stacks, nil)
+	r, _ := testReconciler(t, &mockPoller{}, stacks, nil)
 	paths := r.buildStackPaths()
 
 	if paths["traefik"] != "docker/stacks/server04/traefik" {
@@ -308,7 +347,7 @@ func TestConfigToDeployStacks(t *testing.T) {
 		{Name: "b", Path: "p/b"},
 	}
 
-	r, _ := testReconciler(&mockPoller{}, stacks, nil)
+	r, _ := testReconciler(t, &mockPoller{}, stacks, nil)
 	result := r.configToDeployStacks(stacks)
 
 	if len(result) != 2 {
@@ -331,7 +370,7 @@ func TestRunLoopStopsOnContextCancel(t *testing.T) {
 	dir := t.TempDir()
 	var mu sync.Mutex
 	var calls []deployCall
-	r, _ := testReconciler(poller, nil, mockRunner(&mu, &calls))
+	r, _ := testReconciler(t, poller,nil, mockRunner(&mu, &calls))
 	r.repoDir = dir // exists, so LoadState path
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -351,7 +390,7 @@ func TestRunInitialSync(t *testing.T) {
 	poller := &mockPoller{lastHash: "abc123"}
 	var mu sync.Mutex
 	var calls []deployCall
-	r, status := testReconciler(poller, stacks, mockRunner(&mu, &calls))
+	r, status := testReconciler(t, poller,stacks, mockRunner(&mu, &calls))
 	r.repoDir = t.TempDir()
 	r.initialSync = true
 
@@ -400,7 +439,7 @@ func TestDeployOrderRespectsDependencies(t *testing.T) {
 		return nil
 	}
 
-	r, _ := testReconciler(poller, stacks, runner)
+	r, _ := testReconciler(t, poller,stacks, runner)
 
 	if err := r.reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
@@ -435,14 +474,14 @@ func TestDeployOrderRespectsDependencies(t *testing.T) {
 	}
 }
 
-func TestFilterChangedStacksPreservesOrder(t *testing.T) {
+func TestFilterChangedStacksReturnsCorrectSet(t *testing.T) {
 	stacks := []config.Stack{
 		{Name: "a", Path: "p/a"},
 		{Name: "b", Path: "p/b", DependsOn: []string{"a"}},
 		{Name: "c", Path: "p/c"},
 	}
 
-	r, _ := testReconciler(&mockPoller{}, stacks, nil)
+	r, _ := testReconciler(t, &mockPoller{}, stacks, nil)
 	result := r.filterChangedStacks([]string{"c", "a"})
 
 	names := make([]string, len(result))

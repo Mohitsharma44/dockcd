@@ -106,7 +106,7 @@ func (p *Poller) Fetch() (bool, error) {
 	cmd.Dir = p.localDir
 	out, err = cmd.Output()
 	if err != nil {
-		return false, fmt.Errorf("git rev-parse origin/main: %w", err)
+		return false, fmt.Errorf("git rev-parse origin/%s: %w", p.branch, err)
 	}
 	remoteHead := strings.TrimSpace(string(out))
 
