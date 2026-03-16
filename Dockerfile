@@ -22,6 +22,7 @@ RUN apt-get update && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         docker-ce-cli docker-compose-plugin && \
+    apt-get purge -y --auto-remove curl gnupg && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /dockcd /usr/local/bin/dockcd

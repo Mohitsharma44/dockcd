@@ -2,76 +2,16 @@ package git
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/mohitsharma44/dockcd/internal/testutil"
 )
 
-// initBareRepo creates a bare git repo and returns its path.
-// This is our "remote" - like github
-func initBareRepo(t *testing.T) string {
-	t.Helper()
-	dir := filepath.Join(t.TempDir(), "remote.git")
-	cmd := exec.Command("git", "init", "--bare", dir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git init --bare: %s\n%s", err, out)
-	}
-	return dir
-}
-
-// cloneAndCommit clones the bare repo, adds a file, and commits.
-// Returns the clone dir and the commit hash.
-func cloneAndCommit(t *testing.T, bareDir, filePath, content string) (string, string) {
-	t.Helper()
-	workDir := filepath.Join(t.TempDir(), "work")
-	run(t, "", "git", "clone", bareDir, workDir)
-	run(t, workDir, "git", "config", "user.email", "test@test.com")
-	run(t, workDir, "git", "config", "user.name", "Test")
-
-	fullPath := filepath.Join(workDir, filePath)
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	run(t, workDir, "git", "add", ".")
-	run(t, workDir, "git", "commit", "-m", "add "+filePath)
-	run(t, workDir, "git", "push")
-
-	hash := runOutput(t, workDir, "git", "rev-parse", "HEAD")
-	return workDir, hash
-}
-
-func run(t *testing.T, dir string, name string, args ...string) {
-	t.Helper()
-	cmd := exec.Command(name, args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("%s %v: %s\n%s", name, args, err, out)
-	}
-}
-
-func runOutput(t *testing.T, dir string, name string, args ...string) string {
-	t.Helper()
-	cmd := exec.Command(name, args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("%s %v: %s", name, args, err)
-	}
-	return strings.TrimSpace(string(out))
-}
-
 func TestClone(t *testing.T) {
-	bare := initBareRepo(t)
-	cloneAndCommit(t, bare, "stacks/app/compose.yaml", "version: '3'")
+	bare := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bare)
+	testutil.CommitFile(t, workDir, "stacks/app/compose.yaml", "version: '3'", "add stacks/app/compose.yaml")
 
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 	p := NewPoller(bare, cloneDir)
@@ -87,8 +27,9 @@ func TestClone(t *testing.T) {
 }
 
 func TestFetchDetectsNewCommit(t *testing.T) {
-	bare := initBareRepo(t)
-	workDir, _ := cloneAndCommit(t, bare, "stacks/app/compose.yaml", "version: '3'")
+	bare := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bare)
+	testutil.CommitFile(t, workDir, "stacks/app/compose.yaml", "version: '3'", "add stacks/app/compose.yaml")
 
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 	p := NewPoller(bare, cloneDir)
@@ -98,16 +39,7 @@ func TestFetchDetectsNewCommit(t *testing.T) {
 	}
 
 	// Simulate a new push from the "developer"
-	newFile := filepath.Join(workDir, "stacks/db/compose.yaml")
-	if err := os.MkdirAll(filepath.Dir(newFile), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(newFile, []byte("version: '3'"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	run(t, workDir, "git", "add", ".")
-	run(t, workDir, "git", "commit", "-m", "add db stack")
-	run(t, workDir, "git", "push")
+	testutil.CommitFile(t, workDir, "stacks/db/compose.yaml", "version: '3'", "add db stack")
 
 	// Poller should detect the change
 	changed, err := p.Fetch()
@@ -120,8 +52,9 @@ func TestFetchDetectsNewCommit(t *testing.T) {
 }
 
 func TestChangedStacks(t *testing.T) {
-	bare := initBareRepo(t)
-	workDir, hash1 := cloneAndCommit(t, bare, "stacks/app/compose.yaml", "version: '3'")
+	bare := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bare)
+	hash1 := testutil.CommitFile(t, workDir, "stacks/app/compose.yaml", "version: '3'", "add stacks/app/compose.yaml")
 
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 	p := NewPoller(bare, cloneDir)
@@ -133,16 +66,7 @@ func TestChangedStacks(t *testing.T) {
 	p.lastHash = hash1
 
 	// Push changes to only the db stack
-	newFile := filepath.Join(workDir, "stacks/db/compose.yaml")
-	if err := os.MkdirAll(filepath.Dir(newFile), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(newFile, []byte("version: '3'"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	run(t, workDir, "git", "add", ".")
-	run(t, workDir, "git", "commit", "-m", "add db stack")
-	run(t, workDir, "git", "push")
+	testutil.CommitFile(t, workDir, "stacks/db/compose.yaml", "version: '3'", "add db stack")
 
 	changed, err := p.Fetch()
 	if err != nil {
@@ -171,8 +95,9 @@ func TestChangedStacks(t *testing.T) {
 }
 
 func TestFetchNoChanges(t *testing.T) {
-	bare := initBareRepo(t)
-	cloneAndCommit(t, bare, "stacks/app/compose.yaml", "version: '3'")
+	bare := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bare)
+	testutil.CommitFile(t, workDir, "stacks/app/compose.yaml", "version: '3'", "add stacks/app/compose.yaml")
 
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 	p := NewPoller(bare, cloneDir)
@@ -192,8 +117,9 @@ func TestFetchNoChanges(t *testing.T) {
 }
 
 func TestCloneSetsLastHash(t *testing.T) {
-	bare := initBareRepo(t)
-	_, expectedHash := cloneAndCommit(t, bare, "stacks/app/compose.yaml", "version: '3'")
+	bare := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bare)
+	expectedHash := testutil.CommitFile(t, workDir, "stacks/app/compose.yaml", "version: '3'", "add stacks/app/compose.yaml")
 
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 	p := NewPoller(bare, cloneDir)
@@ -208,8 +134,9 @@ func TestCloneSetsLastHash(t *testing.T) {
 }
 
 func TestStateFilePersistence(t *testing.T) {
-	bare := initBareRepo(t)
-	_, hash1 := cloneAndCommit(t, bare, "stacks/app/compose.yaml", "version: '3'")
+	bare := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bare)
+	hash1 := testutil.CommitFile(t, workDir, "stacks/app/compose.yaml", "version: '3'", "add stacks/app/compose.yaml")
 
 	stateFile := filepath.Join(t.TempDir(), "state")
 	cloneDir := filepath.Join(t.TempDir(), "clone")

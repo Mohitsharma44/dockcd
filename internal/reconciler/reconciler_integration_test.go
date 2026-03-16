@@ -4,10 +4,7 @@ package reconciler
 
 import (
 	"context"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,80 +12,17 @@ import (
 	"github.com/mohitsharma44/dockcd/internal/config"
 	"github.com/mohitsharma44/dockcd/internal/git"
 	"github.com/mohitsharma44/dockcd/internal/server"
+	"github.com/mohitsharma44/dockcd/internal/testutil"
 )
-
-// --- git helpers (duplicated from internal/git since test helpers aren't cross-package) ---
-
-func initBareRepo(t *testing.T) string {
-	t.Helper()
-	dir := filepath.Join(t.TempDir(), "remote.git")
-	cmd := exec.Command("git", "init", "--bare", dir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git init --bare: %s\n%s", err, out)
-	}
-	return dir
-}
-
-func gitRun(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %v: %s\n%s", args, err, out)
-	}
-}
-
-func gitOutput(t *testing.T, dir string, args ...string) string {
-	t.Helper()
-	cmd := exec.Command("git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("git %v: %s", args, err)
-	}
-	return strings.TrimSpace(string(out))
-}
-
-// setupWorkDir clones the bare repo, configures git user, and returns the work dir.
-func setupWorkDir(t *testing.T, bareDir string) string {
-	t.Helper()
-	workDir := filepath.Join(t.TempDir(), "work")
-	gitRun(t, "", "clone", bareDir, workDir)
-	gitRun(t, workDir, "config", "user.email", "test@test.com")
-	gitRun(t, workDir, "config", "user.name", "Test")
-	return workDir
-}
-
-// commitFile writes a file, stages, commits, and pushes. Returns the commit hash.
-func commitFile(t *testing.T, workDir, filePath, content, msg string) string {
-	t.Helper()
-	fullPath := filepath.Join(workDir, filePath)
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
-		t.Fatal(err)
-	}
-	gitRun(t, workDir, "add", ".")
-	gitRun(t, workDir, "commit", "-m", msg)
-	gitRun(t, workDir, "push")
-	return gitOutput(t, workDir, "rev-parse", "HEAD")
-}
-
-// --- integration tests ---
 
 func TestIntegrationReconcileLoop(t *testing.T) {
 	// 1. Create bare repo (the "remote").
-	bareDir := initBareRepo(t)
+	bareDir := testutil.InitBareRepo(t)
 
 	// 2. Clone and push initial stack files.
-	workDir := setupWorkDir(t, bareDir)
-	commitFile(t, workDir, "stacks/web/compose.yaml", "services:\n  web:\n    image: nginx", "add web stack")
-	commitFile(t, workDir, "stacks/db/compose.yaml", "services:\n  db:\n    image: postgres", "add db stack")
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml", "services:\n  web:\n    image: nginx", "add web stack")
+	testutil.CommitFile(t, workDir, "stacks/db/compose.yaml", "services:\n  db:\n    image: postgres", "add db stack")
 
 	// 3. Create a real git.Poller and clone.
 	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
@@ -170,7 +104,7 @@ func TestIntegrationReconcileLoop(t *testing.T) {
 	calls = nil // reset
 	mu.Unlock()
 
-	commitFile(t, workDir, "stacks/db/compose.yaml",
+	testutil.CommitFile(t, workDir, "stacks/db/compose.yaml",
 		"services:\n  db:\n    image: postgres:16", "update db stack")
 
 	// 9. reconcile — should detect the change and deploy only db.
@@ -195,16 +129,16 @@ func TestIntegrationReconcileLoop(t *testing.T) {
 
 	// 10. Verify status was updated with the latest commit.
 	_, commit := status.Snapshot()
-	latestHash := gitOutput(t, workDir, "rev-parse", "HEAD")
+	latestHash := testutil.GitOutput(t, workDir, "rev-parse", "HEAD")
 	if commit != latestHash {
 		t.Errorf("expected status commit %q, got %q", latestHash, commit)
 	}
 }
 
 func TestIntegrationNoChangesNoDeploy(t *testing.T) {
-	bareDir := initBareRepo(t)
-	workDir := setupWorkDir(t, bareDir)
-	commitFile(t, workDir, "stacks/app/compose.yaml", "services:\n  app:\n    image: nginx", "add app")
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	testutil.CommitFile(t, workDir, "stacks/app/compose.yaml", "services:\n  app:\n    image: nginx", "add app")
 
 	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
 	poller := git.NewPoller(bareDir, cloneDir)
@@ -250,9 +184,9 @@ func TestIntegrationNoChangesNoDeploy(t *testing.T) {
 }
 
 func TestIntegrationRunLoopWithInitialSync(t *testing.T) {
-	bareDir := initBareRepo(t)
-	workDir := setupWorkDir(t, bareDir)
-	commitFile(t, workDir, "stacks/app/compose.yaml", "services:\n  app:\n    image: nginx", "add app")
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	testutil.CommitFile(t, workDir, "stacks/app/compose.yaml", "services:\n  app:\n    image: nginx", "add app")
 
 	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
 	poller := git.NewPoller(bareDir, cloneDir)

@@ -15,10 +15,10 @@ TimeoutStopSec=30s
 
 User=dockcd
 Group=docker
+StateDirectory=dockcd
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/dockcd
 
 StandardOutput=journal
 StandardError=journal
