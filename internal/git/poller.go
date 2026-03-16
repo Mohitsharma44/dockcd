@@ -77,6 +77,17 @@ func (p *Poller) LoadState() error {
 }
 
 func (p *Poller) Fetch() (bool, error) {
+	// Detect branch if not set (e.g. after restart with LoadState).
+	if p.branch == "" {
+		cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
+		cmd.Dir = p.localDir
+		out, err := cmd.Output()
+		if err != nil {
+			return false, fmt.Errorf("detecting default branch: %w", err)
+		}
+		p.branch = strings.TrimPrefix(strings.TrimSpace(string(out)), "refs/remotes/origin/")
+	}
+
 	cmd := exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = p.localDir
 	out, err := cmd.Output()
@@ -95,7 +106,7 @@ func (p *Poller) Fetch() (bool, error) {
 	cmd.Dir = p.localDir
 	out, err = cmd.Output()
 	if err != nil {
-		return false, fmt.Errorf("git rev-parse origin/main: %w", err)
+		return false, fmt.Errorf("git rev-parse origin/%s: %w", p.branch, err)
 	}
 	remoteHead := strings.TrimSpace(string(out))
 
