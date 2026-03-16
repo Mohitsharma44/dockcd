@@ -12,7 +12,7 @@ import (
 func InitBareRepo(t *testing.T) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "remote.git")
-	cmd := exec.Command("git", "init", "--bare", dir)
+	cmd := exec.Command("git", "init", "--bare", "--initial-branch=main", dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init --bare: %s\n%s", err, out)
 	}
@@ -67,6 +67,6 @@ func CommitFile(t *testing.T, workDir, filePath, content, msg string) string {
 	}
 	GitRun(t, workDir, "add", ".")
 	GitRun(t, workDir, "commit", "-m", msg)
-	GitRun(t, workDir, "push")
+	GitRun(t, workDir, "push", "-u", "origin", "HEAD")
 	return GitOutput(t, workDir, "rev-parse", "HEAD")
 }
