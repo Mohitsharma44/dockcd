@@ -1,0 +1,7 @@
+.git/
+.fastembed_cache/
+dockcd
+PLAN.md
+.env
+*.test
+*.out
