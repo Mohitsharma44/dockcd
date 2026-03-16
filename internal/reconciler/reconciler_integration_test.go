@@ -192,12 +192,21 @@ func TestIntegrationRunLoopWithInitialSync(t *testing.T) {
 	poller := git.NewPoller(bareDir, cloneDir)
 	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
 
+	// Cancel context once we observe the expected deploy calls (avoids waiting for timeout).
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	var mu sync.Mutex
 	var calls []deployCall
-	runner := func(ctx context.Context, dir, name string, args ...string) error {
+	runner := func(rctx context.Context, dir, name string, args ...string) error {
 		mu.Lock()
-		defer mu.Unlock()
 		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		n := len(calls)
+		mu.Unlock()
+		// 1 stack × 2 commands (pull + up) = 2 calls expected.
+		if n >= 2 {
+			cancel()
+		}
 		return nil
 	}
 
@@ -215,10 +224,6 @@ func TestIntegrationRunLoopWithInitialSync(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-
-	// Run with a short-lived context — exercises the full Run() path.
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
 
 	if err := rec.Run(ctx); err != nil {
 		t.Fatalf("Run() failed: %v", err)
