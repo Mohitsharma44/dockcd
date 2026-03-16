@@ -1,0 +1,28 @@
+[Unit]
+Description=dockcd - GitOps CD agent for Docker Compose
+Documentation=https://github.com/mohitsharma44/dockcd
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=exec
+EnvironmentFile=-/etc/dockcd/dockcd.env
+ExecStart=/usr/local/bin/dockcd --config /etc/dockcd/gitops.yaml --repo-dir /var/lib/dockcd/repo --log-format json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+User=dockcd
+Group=docker
+StateDirectory=dockcd
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dockcd
+
+[Install]
+WantedBy=multi-user.target
