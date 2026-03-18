@@ -4,16 +4,23 @@ package reconciler
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mohitsharma44/dockcd/internal/config"
+	"github.com/mohitsharma44/dockcd/internal/deploy"
 	"github.com/mohitsharma44/dockcd/internal/git"
 	"github.com/mohitsharma44/dockcd/internal/server"
 	"github.com/mohitsharma44/dockcd/internal/testutil"
 )
+
+func writeFile(path, content string) error {
+	return os.WriteFile(path, []byte(content), 0644)
+}
 
 func TestIntegrationReconcileLoop(t *testing.T) {
 	// 1. Create bare repo (the "remote").
@@ -241,5 +248,274 @@ func TestIntegrationRunLoopWithInitialSync(t *testing.T) {
 	_, commit := status.Snapshot()
 	if commit == "" {
 		t.Error("expected status commit to be set after initial sync")
+	}
+}
+
+func TestIntegrationHealthyDeployRecordsSuccessfulCommit(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	goodHash := testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "add web stack")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		return nil
+	}
+
+	// Output runner that reports healthy containers.
+	outputRunner := func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte(`{"Name":"web-1","State":"running","Health":""}` + "\n"), nil
+	}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:       poller,
+		HostStacks:   []config.Stack{{Name: "web", Path: "stacks/web"}},
+		Hostname:     "integration-test",
+		RepoDir:      cloneDir,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		OutputRunner: outputRunner,
+		Status:       status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	// Deploy the stack with health check.
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "stacks/web",
+		HealthCheckTimeout: 5 * time.Second,
+		AutoRollback:       true,
+	}
+
+	if err := rec.deployStack(context.Background(), stack, goodHash); err != nil {
+		t.Fatalf("deployStack failed: %v", err)
+	}
+
+	// Verify lastSuccessfulCommit was recorded via the real poller's state.
+	if got := poller.LastSuccessfulCommit("web"); got != goodHash {
+		t.Errorf("expected lastSuccessfulCommit=%q, got %q", goodHash, got)
+	}
+}
+
+func TestIntegrationRollbackToLastGoodCommit(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+
+	// Commit 1: "good" version.
+	goodHash := testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx:good", "good deploy")
+
+	// Commit 2: "bad" version.
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx:bad", "bad deploy")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		return nil
+	}
+
+	// Output runner: always reports unhealthy (simulates bad deploy).
+	outputRunner := func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte(`{"Name":"web-1","State":"exited","Health":""}` + "\n"), nil
+	}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:       poller,
+		HostStacks:   []config.Stack{{Name: "web", Path: "stacks/web"}},
+		Hostname:     "integration-test",
+		RepoDir:      cloneDir,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		OutputRunner: outputRunner,
+		Status:       status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	// Manually record the good commit as lastSuccessfulCommit (simulating a prior successful deploy).
+	if err := poller.SetLastSuccessfulCommit("web", goodHash); err != nil {
+		t.Fatalf("SetLastSuccessfulCommit failed: %v", err)
+	}
+
+	// Deploy the "bad" commit with health check that will fail.
+	badHash := poller.LastHash()
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "stacks/web",
+		HealthCheckTimeout: 1 * time.Millisecond, // fail fast
+		AutoRollback:       true,
+	}
+
+	err = rec.deployStack(context.Background(), stack, badHash)
+	// Rollback should succeed — no error returned.
+	if err != nil {
+		t.Fatalf("deployStack should succeed after rollback, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Expect: initial deploy (pull+up) + rollback deploy (pull+up) = 4 calls.
+	if len(calls) != 4 {
+		t.Fatalf("expected 4 calls (deploy + rollback), got %d: %+v", len(calls), calls)
+	}
+
+	// The rollback deploy should be from a temp dir (not the repo clone dir).
+	rollbackPullDir := calls[2].dir
+	rollbackUpDir := calls[3].dir
+	if strings.HasPrefix(rollbackPullDir, cloneDir) {
+		t.Errorf("rollback should deploy from temp dir, not clone dir: %s", rollbackPullDir)
+	}
+	if rollbackPullDir != rollbackUpDir {
+		t.Errorf("rollback pull and up should use same dir: %s vs %s", rollbackPullDir, rollbackUpDir)
+	}
+
+	// lastSuccessfulCommit should still be the good hash (not updated to bad).
+	if got := poller.LastSuccessfulCommit("web"); got != goodHash {
+		t.Errorf("lastSuccessfulCommit should still be %q, got %q", goodHash, got)
+	}
+}
+
+func TestIntegrationNoHistoryNoRollback(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "first deploy")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		return nil
+	}
+
+	outputRunner := func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte(`{"Name":"web-1","State":"exited","Health":""}` + "\n"), nil
+	}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:       poller,
+		HostStacks:   []config.Stack{{Name: "web", Path: "stacks/web"}},
+		Hostname:     "integration-test",
+		RepoDir:      cloneDir,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		OutputRunner: outputRunner,
+		Status:       status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	// No lastSuccessfulCommit set — first deploy ever.
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "stacks/web",
+		HealthCheckTimeout: 1 * time.Millisecond,
+		AutoRollback:       true,
+	}
+
+	err = rec.deployStack(context.Background(), stack, poller.LastHash())
+	if err == nil {
+		t.Fatal("expected error when no rollback history exists")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Should only have the initial deploy (pull+up), no rollback.
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 calls (deploy only), got %d", len(calls))
+	}
+}
+
+func TestIntegrationStateFileMigration(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	hash := testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "add web")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	stateFile := filepath.Join(cloneDir, ".dockcd_state")
+
+	// Create a legacy plain-text state file.
+	poller1 := git.NewPoller(bareDir, cloneDir)
+	if err := poller1.Clone(); err != nil {
+		t.Fatalf("Clone failed: %v", err)
+	}
+
+	// Write legacy format (just the hash).
+	if err := writeFile(stateFile, hash); err != nil {
+		t.Fatalf("writing legacy state: %v", err)
+	}
+
+	// New poller should load legacy format successfully.
+	poller2 := git.NewPoller(bareDir, cloneDir)
+	poller2.SetStateFile(stateFile)
+	if err := poller2.LoadState(); err != nil {
+		t.Fatalf("LoadState failed: %v", err)
+	}
+
+	if got := poller2.LastHash(); got != hash {
+		t.Errorf("expected LastHash=%q, got %q", hash, got)
+	}
+
+	// SetLastSuccessfulCommit should upgrade to JSON format.
+	if err := poller2.SetLastSuccessfulCommit("web", hash); err != nil {
+		t.Fatalf("SetLastSuccessfulCommit failed: %v", err)
+	}
+
+	// Load again — should read JSON format.
+	poller3 := git.NewPoller(bareDir, cloneDir)
+	poller3.SetStateFile(stateFile)
+	if err := poller3.LoadState(); err != nil {
+		t.Fatalf("LoadState (JSON) failed: %v", err)
+	}
+
+	if got := poller3.LastHash(); got != hash {
+		t.Errorf("expected LastHash=%q after JSON migration, got %q", hash, got)
+	}
+	if got := poller3.LastSuccessfulCommit("web"); got != hash {
+		t.Errorf("expected LastSuccessfulCommit(web)=%q, got %q", hash, got)
 	}
 }
