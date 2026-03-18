@@ -9,3 +9,5 @@ hosts:
         path: app/
         depends_on: [monitoring]
         post_deploy_delay: 30s
+        health_check_timeout: 90s
+        auto_rollback: true

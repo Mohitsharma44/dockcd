@@ -19,18 +19,40 @@ type HostConfig struct {
 }
 
 type Stack struct {
-	Name            string        `yaml:"name"`
-	Path            string        `yaml:"path"`
-	DependsOn       []string      `yaml:"depends_on"`
-	PostDeployDelay time.Duration `yaml:"post_deploy_delay"`
+	Name               string         `yaml:"name"`
+	Path               string         `yaml:"path"`
+	DependsOn          []string       `yaml:"depends_on"`
+	PostDeployDelay    time.Duration  `yaml:"post_deploy_delay"`
+	HealthCheckTimeout *time.Duration `yaml:"health_check_timeout"`
+	AutoRollback       *bool          `yaml:"auto_rollback"`
+}
+
+// RollbackEnabled returns whether auto-rollback is enabled for this stack.
+// Defaults to true if not explicitly set.
+func (s *Stack) RollbackEnabled() bool {
+	if s.AutoRollback == nil {
+		return true
+	}
+	return *s.AutoRollback
+}
+
+// HealthTimeout returns the health check timeout.
+// Defaults to 60s if not set. Returns 0 if explicitly set to 0 (disables health check).
+func (s *Stack) HealthTimeout() time.Duration {
+	if s.HealthCheckTimeout == nil {
+		return 60 * time.Second
+	}
+	return *s.HealthCheckTimeout
 }
 
 func (s *Stack) UnmarshalYAML(value *yaml.Node) error {
 	var raw struct {
-		Name            string   `yaml:"name"`
-		Path            string   `yaml:"path"`
-		DependsOn       []string `yaml:"depends_on"`
-		PostDeployDelay string   `yaml:"post_deploy_delay"`
+		Name               string   `yaml:"name"`
+		Path               string   `yaml:"path"`
+		DependsOn          []string `yaml:"depends_on"`
+		PostDeployDelay    string   `yaml:"post_deploy_delay"`
+		HealthCheckTimeout string   `yaml:"health_check_timeout"`
+		AutoRollback       *bool    `yaml:"auto_rollback"`
 	}
 	if err := value.Decode(&raw); err != nil {
 		return err
@@ -38,12 +60,21 @@ func (s *Stack) UnmarshalYAML(value *yaml.Node) error {
 	s.Name = raw.Name
 	s.Path = raw.Path
 	s.DependsOn = raw.DependsOn
+	s.AutoRollback = raw.AutoRollback
 	if raw.PostDeployDelay != "" {
 		d, err := time.ParseDuration(raw.PostDeployDelay)
 		if err != nil {
 			return fmt.Errorf("invalid post_deploy_delay %q for stack %q: %w", raw.PostDeployDelay, raw.Name, err)
 		}
 		s.PostDeployDelay = d
+	}
+	if raw.HealthCheckTimeout != "" {
+		d, err := time.ParseDuration(raw.HealthCheckTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid health_check_timeout %q for stack %q: %w", raw.HealthCheckTimeout, raw.Name, err)
+		}
+		timeout := d
+		s.HealthCheckTimeout = &timeout
 	}
 	return nil
 }
