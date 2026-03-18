@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -239,18 +240,25 @@ func (r *Reconciler) deployGroups(ctx context.Context, groups [][]deploy.Stack, 
 	for i, group := range groups {
 		// Use a plain errgroup (no context cancellation) so that a
 		// rollback in one stack doesn't cancel sibling deploys.
+		// ErrRolledBack is treated as a non-error inside the goroutine
+		// (tracked via atomic flag) so it doesn't mask real failures.
 		var g errgroup.Group
+		var groupRolledBack atomic.Bool
 		for _, stack := range group {
 			g.Go(func() error {
-				return r.deployStack(ctx, stack, commitHash)
+				err := r.deployStack(ctx, stack, commitHash)
+				if errors.Is(err, ErrRolledBack) {
+					groupRolledBack.Store(true)
+					return nil // don't mask real errors
+				}
+				return err
 			})
 		}
 		if err := g.Wait(); err != nil {
-			if errors.Is(err, ErrRolledBack) {
-				rolledBack = true
-				continue // stack is running (rolled back), proceed with downstream
-			}
 			return fmt.Errorf("group %d: %w", i+1, err)
+		}
+		if groupRolledBack.Load() {
+			rolledBack = true
 		}
 	}
 	if rolledBack {
@@ -275,7 +283,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commit
 
 			if !stack.AutoRollback {
 				r.markStackHealth(ctx, stack.Name, false)
-				return fmt.Errorf("stack %q unhealthy, auto_rollback disabled", stack.Name)
+				return fmt.Errorf("stack %q unhealthy, auto_rollback disabled: %w", stack.Name, err)
 			}
 
 			return r.rollback(ctx, stack, commitHash)

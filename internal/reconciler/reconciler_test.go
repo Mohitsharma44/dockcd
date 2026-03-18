@@ -479,7 +479,7 @@ func TestDeployOrderRespectsDependencies(t *testing.T) {
 	var order []string
 	runner := func(ctx context.Context, dir, name string, args ...string) error {
 		// Only track "compose up" calls, not "compose pull".
-		if args[0] == "compose" && slices.Contains(args, "up") {
+		if len(args) > 0 && args[0] == "compose" && slices.Contains(args, "up") {
 			mu.Lock()
 			order = append(order, dir)
 			mu.Unlock()

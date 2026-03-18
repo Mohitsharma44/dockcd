@@ -93,7 +93,7 @@ func TestIntegrationReconcileLoop(t *testing.T) {
 	mu.Lock()
 	var upDirs []string
 	for _, c := range calls {
-		if c.args[0] == "compose" && slices.Contains(c.args, "up") {
+		if len(c.args) > 0 && c.args[0] == "compose" && slices.Contains(c.args, "up") {
 			upDirs = append(upDirs, c.dir)
 		}
 	}
