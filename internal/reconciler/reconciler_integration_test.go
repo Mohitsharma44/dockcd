@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -92,7 +93,7 @@ func TestIntegrationReconcileLoop(t *testing.T) {
 	mu.Lock()
 	var upDirs []string
 	for _, c := range calls {
-		if len(c.args) > 1 && c.args[0] == "compose" && c.args[1] == "up" {
+		if c.args[0] == "compose" && slices.Contains(c.args, "up") {
 			upDirs = append(upDirs, c.dir)
 		}
 	}
