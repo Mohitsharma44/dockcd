@@ -27,6 +27,11 @@ func TestParseComposePS(t *testing.T) {
 			want: 2,
 		},
 		{
+			name:  "json array format",
+			input: `[{"Name":"web-1","State":"running","Health":"healthy"},{"Name":"db-1","State":"running","Health":""}]`,
+			want:  2,
+		},
+		{
 			name:  "empty output",
 			input: "",
 			want:  0,

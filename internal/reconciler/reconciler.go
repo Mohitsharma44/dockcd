@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -17,6 +18,10 @@ import (
 	"github.com/mohitsharma44/dockcd/internal/metrics"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
+
+// ErrRolledBack is returned when a stack was rolled back to its last known
+// good version. The stack is running but degraded (not at HEAD).
+var ErrRolledBack = fmt.Errorf("stack rolled back")
 
 // GitPoller abstracts git operations so the reconciler can be tested
 // without real git repos.
@@ -200,9 +205,19 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	err = r.deployGroups(ctx, groups, commitHash)
 	duration := time.Since(start)
 
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrRolledBack) {
 		r.recordDeployMetric(ctx, "failure", duration)
 		return fmt.Errorf("deploy: %w", err)
+	}
+
+	if errors.Is(err, ErrRolledBack) {
+		r.recordDeployMetric(ctx, "partial", duration)
+		r.status.Update(time.Now(), r.poller.LastHash())
+		r.logger.Warn("deploy complete with rollbacks",
+			"duration", duration,
+			"stacks", changedNames,
+		)
+		return nil
 	}
 
 	r.recordDeployMetric(ctx, "success", duration)
@@ -217,7 +232,10 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 
 // deployGroups deploys groups sequentially, stacks within a group in parallel.
 // Each stack gets health-checked and optionally rolled back on failure.
+// A successful rollback (ErrRolledBack) does not stop deployment of downstream groups.
+// Only hard failures (deploy error, failed rollback) halt the pipeline.
 func (r *Reconciler) deployGroups(ctx context.Context, groups [][]deploy.Stack, commitHash string) error {
+	var rolledBack bool
 	for i, group := range groups {
 		g, gCtx := errgroup.WithContext(ctx)
 		for _, stack := range group {
@@ -226,8 +244,15 @@ func (r *Reconciler) deployGroups(ctx context.Context, groups [][]deploy.Stack, 
 			})
 		}
 		if err := g.Wait(); err != nil {
+			if errors.Is(err, ErrRolledBack) {
+				rolledBack = true
+				continue // stack is running (rolled back), proceed with downstream
+			}
 			return fmt.Errorf("group %d: %w", i+1, err)
 		}
+	}
+	if rolledBack {
+		return ErrRolledBack
 	}
 	return nil
 }
@@ -310,17 +335,23 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	r.recordRollbackMetric(ctx, stack.Name, "success")
 	r.logger.Warn("rollback complete, stack is degraded",
 		"stack", stack.Name, "running_commit", lastGood)
-	return nil
+	return fmt.Errorf("stack %q: %w to %s", stack.Name, ErrRolledBack, lastGood)
 }
 
 // deployAll deploys all configured stacks in dependency order.
+// Uses deployGroups to run health checks and establish rollback history.
 func (r *Reconciler) deployAll(ctx context.Context) error {
 	stacks := r.configToDeployStacks(r.hostStacks)
 	groups, err := deploy.BuildGraph(stacks)
 	if err != nil {
 		return fmt.Errorf("building deploy graph: %w", err)
 	}
-	return deploy.RunGroups(ctx, groups, r.repoDir, r.runner)
+	commitHash := r.poller.LastHash()
+	err = r.deployGroups(ctx, groups, commitHash)
+	if errors.Is(err, ErrRolledBack) {
+		return nil // some stacks rolled back but are running
+	}
+	return err
 }
 
 // buildStackPaths returns a map of stack name → path relative to repo root.

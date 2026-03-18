@@ -4,6 +4,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -376,9 +377,9 @@ func TestIntegrationRollbackToLastGoodCommit(t *testing.T) {
 	}
 
 	err = rec.deployStack(context.Background(), stack, badHash)
-	// Rollback should succeed — no error returned.
-	if err != nil {
-		t.Fatalf("deployStack should succeed after rollback, got: %v", err)
+	// Rollback should succeed — returns ErrRolledBack.
+	if !errors.Is(err, ErrRolledBack) {
+		t.Fatalf("expected ErrRolledBack, got: %v", err)
 	}
 
 	mu.Lock()

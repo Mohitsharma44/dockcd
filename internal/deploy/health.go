@@ -76,8 +76,24 @@ func checkContainers(ctx context.Context, dir string, run OutputRunner) (bool, e
 	return true, nil
 }
 
-// parseComposePS parses the NDJSON output from `docker compose ps --format json`.
+// parseComposePS parses docker compose ps --format json output.
+// Supports both JSON array format (newer compose) and NDJSON (one object per line).
 func parseComposePS(data []byte) ([]ContainerStatus, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+
+	// Try JSON array first (newer docker compose versions).
+	if trimmed[0] == '[' {
+		var containers []ContainerStatus
+		if err := json.Unmarshal(trimmed, &containers); err != nil {
+			return nil, fmt.Errorf("parsing container status array: %w", err)
+		}
+		return containers, nil
+	}
+
+	// Fall back to NDJSON (one JSON object per line).
 	var containers []ContainerStatus
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {

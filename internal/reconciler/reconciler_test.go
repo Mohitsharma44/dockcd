@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -591,9 +592,9 @@ func TestDeployStackUnhealthyTriggersRollback(t *testing.T) {
 	}
 
 	err := r.deployStack(context.Background(), stack, "bad456")
-	// Should succeed (rollback completed) — err is nil when rollback works.
-	if err != nil {
-		t.Fatalf("deployStack should succeed after rollback, got: %v", err)
+	// Rollback succeeded — should return ErrRolledBack.
+	if !errors.Is(err, ErrRolledBack) {
+		t.Fatalf("expected ErrRolledBack, got: %v", err)
 	}
 
 	mu.Lock()

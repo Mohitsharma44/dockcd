@@ -19,12 +19,12 @@ type HostConfig struct {
 }
 
 type Stack struct {
-	Name               string        `yaml:"name"`
-	Path               string        `yaml:"path"`
-	DependsOn          []string      `yaml:"depends_on"`
-	PostDeployDelay    time.Duration `yaml:"post_deploy_delay"`
-	HealthCheckTimeout time.Duration `yaml:"health_check_timeout"`
-	AutoRollback       *bool         `yaml:"auto_rollback"`
+	Name               string         `yaml:"name"`
+	Path               string         `yaml:"path"`
+	DependsOn          []string       `yaml:"depends_on"`
+	PostDeployDelay    time.Duration  `yaml:"post_deploy_delay"`
+	HealthCheckTimeout *time.Duration `yaml:"health_check_timeout"`
+	AutoRollback       *bool          `yaml:"auto_rollback"`
 }
 
 // RollbackEnabled returns whether auto-rollback is enabled for this stack.
@@ -36,12 +36,13 @@ func (s *Stack) RollbackEnabled() bool {
 	return *s.AutoRollback
 }
 
-// HealthTimeout returns the health check timeout, defaulting to 60s.
+// HealthTimeout returns the health check timeout.
+// Defaults to 60s if not set. Returns 0 if explicitly set to 0 (disables health check).
 func (s *Stack) HealthTimeout() time.Duration {
-	if s.HealthCheckTimeout == 0 {
+	if s.HealthCheckTimeout == nil {
 		return 60 * time.Second
 	}
-	return s.HealthCheckTimeout
+	return *s.HealthCheckTimeout
 }
 
 func (s *Stack) UnmarshalYAML(value *yaml.Node) error {
@@ -72,7 +73,8 @@ func (s *Stack) UnmarshalYAML(value *yaml.Node) error {
 		if err != nil {
 			return fmt.Errorf("invalid health_check_timeout %q for stack %q: %w", raw.HealthCheckTimeout, raw.Name, err)
 		}
-		s.HealthCheckTimeout = d
+		timeout := d
+		s.HealthCheckTimeout = &timeout
 	}
 	return nil
 }

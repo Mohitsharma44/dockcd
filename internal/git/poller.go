@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // State is the JSON-serialized state file format.
@@ -22,6 +23,7 @@ type Poller struct {
 	stateFile string
 	branch    string
 	state     State
+	mu        sync.Mutex // protects state and file writes
 }
 
 func NewPoller(repoURL, localDir string) *Poller {
@@ -69,6 +71,13 @@ func (p *Poller) SetStateFile(path string) {
 }
 
 func (p *Poller) saveState() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.saveStateLocked()
+}
+
+// saveStateLocked writes state to disk. Caller must hold p.mu.
+func (p *Poller) saveStateLocked() error {
 	if p.stateFile == "" {
 		return nil
 	}
@@ -108,13 +117,17 @@ func (p *Poller) LoadState() error {
 // LastSuccessfulCommit returns the last commit at which the given stack
 // was successfully deployed. Returns empty string if no history.
 func (p *Poller) LastSuccessfulCommit(stack string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.state.LastSuccessfulCommits[stack]
 }
 
 // SetLastSuccessfulCommit records a successful deploy for a stack and persists state.
 func (p *Poller) SetLastSuccessfulCommit(stack, hash string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.state.LastSuccessfulCommits[stack] = hash
-	return p.saveState()
+	return p.saveStateLocked()
 }
 
 // ExtractAtCommit writes the files under pathPrefix at the given commit to destDir.
