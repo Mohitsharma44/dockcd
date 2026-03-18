@@ -32,6 +32,7 @@ type mockPoller struct {
 	lastSuccessful       map[string]string
 	extractErr           error
 	extractedFiles       map[string]string // path -> content (for rollback tests)
+	mu                   sync.Mutex
 	setSuccessfulCalled  map[string]string // stack -> hash
 }
 
@@ -59,6 +60,8 @@ func (m *mockPoller) LoadState() error {
 }
 
 func (m *mockPoller) LastSuccessfulCommit(stack string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.lastSuccessful == nil {
 		return ""
 	}
@@ -66,6 +69,8 @@ func (m *mockPoller) LastSuccessfulCommit(stack string) string {
 }
 
 func (m *mockPoller) SetLastSuccessfulCommit(stack, hash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.setSuccessfulCalled == nil {
 		m.setSuccessfulCalled = make(map[string]string)
 	}
