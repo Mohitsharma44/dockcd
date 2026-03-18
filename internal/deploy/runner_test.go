@@ -8,6 +8,15 @@ import (
 	"testing"
 )
 
+func containsArg(args []string, target string) bool {
+	for _, a := range args {
+		if a == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRunGroupsSequentialOrder(t *testing.T) {
 	// Track the order stacks are deployed
 	var mu sync.Mutex
@@ -15,7 +24,7 @@ func TestRunGroupsSequentialOrder(t *testing.T) {
 
 	fakeRunner := func(ctx context.Context, dir string, name string, args ...string) error {
 		// Only track compose up calls
-		if len(args) > 1 && args[1] == "up" {
+		if containsArg(args, "up") {
 			mu.Lock()
 			order = append(order, dir)
 			mu.Unlock()
@@ -54,7 +63,7 @@ func TestRunGroupsParallelWithinGroup(t *testing.T) {
 	gate := make(chan struct{})
 
 	fakeRunner := func(ctx context.Context, dir string, name string, args ...string) error {
-		if len(args) > 1 && args[1] == "up" {
+		if containsArg(args, "up") {
 			started <- dir // signal: "I've started"
 			<-gate         // block until gate opens
 		}
@@ -92,7 +101,7 @@ func TestRunGroupsStopsOnError(t *testing.T) {
 	var mu sync.Mutex
 
 	fakeRunner := func(ctx context.Context, dir string, name string, args ...string) error {
-		if len(args) > 1 && args[1] == "up" {
+		if containsArg(args, "up") {
 			mu.Lock()
 			deployCount++
 			mu.Unlock()

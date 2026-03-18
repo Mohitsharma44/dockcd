@@ -237,10 +237,12 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 func (r *Reconciler) deployGroups(ctx context.Context, groups [][]deploy.Stack, commitHash string) error {
 	var rolledBack bool
 	for i, group := range groups {
-		g, gCtx := errgroup.WithContext(ctx)
+		// Use a plain errgroup (no context cancellation) so that a
+		// rollback in one stack doesn't cancel sibling deploys.
+		var g errgroup.Group
 		for _, stack := range group {
 			g.Go(func() error {
-				return r.deployStack(gCtx, stack, commitHash)
+				return r.deployStack(ctx, stack, commitHash)
 			})
 		}
 		if err := g.Wait(); err != nil {
@@ -267,7 +269,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commit
 	// Health check (skip if no OutputRunner or timeout is 0).
 	if r.outputRunner != nil && stack.HealthCheckTimeout > 0 {
 		dir := filepath.Join(r.repoDir, stack.Path)
-		if err := deploy.HealthCheck(ctx, dir, stack.HealthCheckTimeout, r.outputRunner); err != nil {
+		if err := deploy.HealthCheck(ctx, dir, stack.Name, stack.HealthCheckTimeout, r.outputRunner); err != nil {
 			r.logger.Warn("health check failed",
 				"stack", stack.Name, "error", err)
 

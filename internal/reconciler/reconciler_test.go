@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"testing"
@@ -478,7 +479,7 @@ func TestDeployOrderRespectsDependencies(t *testing.T) {
 	var order []string
 	runner := func(ctx context.Context, dir, name string, args ...string) error {
 		// Only track "compose up" calls, not "compose pull".
-		if len(args) > 0 && args[0] == "compose" && len(args) > 1 && args[1] == "up" {
+		if args[0] == "compose" && slices.Contains(args, "up") {
 			mu.Lock()
 			order = append(order, dir)
 			mu.Unlock()

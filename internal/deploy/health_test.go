@@ -69,7 +69,7 @@ func TestCheckContainersHealthy(t *testing.T) {
 `), nil
 	}
 
-	healthy, err := checkContainers(context.Background(), "/tmp", run)
+	healthy, err := checkContainers(context.Background(), "/tmp", "test", run)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestCheckContainersUnhealthy(t *testing.T) {
 `), nil
 	}
 
-	healthy, err := checkContainers(context.Background(), "/tmp", run)
+	healthy, err := checkContainers(context.Background(), "/tmp", "test", run)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestCheckContainersHealthCheckUnhealthy(t *testing.T) {
 		return []byte(`{"Name":"web-1","State":"running","Health":"unhealthy"}` + "\n"), nil
 	}
 
-	healthy, err := checkContainers(context.Background(), "/tmp", run)
+	healthy, err := checkContainers(context.Background(), "/tmp", "test", run)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestCheckContainersEmpty(t *testing.T) {
 		return []byte(""), nil
 	}
 
-	_, err := checkContainers(context.Background(), "/tmp", run)
+	_, err := checkContainers(context.Background(), "/tmp", "test", run)
 	if err == nil {
 		t.Fatal("expected error for empty containers")
 	}
@@ -124,7 +124,7 @@ func TestCheckContainersCommandError(t *testing.T) {
 		return nil, fmt.Errorf("command failed")
 	}
 
-	_, err := checkContainers(context.Background(), "/tmp", run)
+	_, err := checkContainers(context.Background(), "/tmp", "test", run)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -136,7 +136,7 @@ func TestHealthCheckTimeout(t *testing.T) {
 		return []byte(`{"Name":"web-1","State":"exited","Health":""}` + "\n"), nil
 	}
 
-	err := HealthCheck(context.Background(), "/tmp", 50*time.Millisecond, run)
+	err := HealthCheck(context.Background(), "/tmp", "test", 50*time.Millisecond, run)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -147,7 +147,7 @@ func TestHealthCheckSucceeds(t *testing.T) {
 		return []byte(`{"Name":"web-1","State":"running","Health":""}` + "\n"), nil
 	}
 
-	err := HealthCheck(context.Background(), "/tmp", 5*time.Second, run)
+	err := HealthCheck(context.Background(), "/tmp", "test", 5*time.Second, run)
 	if err != nil {
 		t.Fatalf("expected health check to pass: %v", err)
 	}

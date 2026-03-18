@@ -21,7 +21,7 @@ type ContainerStatus struct {
 
 // HealthCheck polls `docker compose ps` until all containers are running
 // (and healthy, if they define a HEALTHCHECK) or the timeout expires.
-func HealthCheck(ctx context.Context, dir string, timeout time.Duration, run OutputRunner) error {
+func HealthCheck(ctx context.Context, dir, projectName string, timeout time.Duration, run OutputRunner) error {
 	deadline := time.After(timeout)
 	// Check immediately, then every 5 seconds.
 	ticker := time.NewTicker(5 * time.Second)
@@ -29,7 +29,7 @@ func HealthCheck(ctx context.Context, dir string, timeout time.Duration, run Out
 
 	var lastErr error
 	for {
-		healthy, err := checkContainers(ctx, dir, run)
+		healthy, err := checkContainers(ctx, dir, projectName, run)
 		if err == nil && healthy {
 			return nil
 		}
@@ -50,8 +50,8 @@ func HealthCheck(ctx context.Context, dir string, timeout time.Duration, run Out
 	}
 }
 
-func checkContainers(ctx context.Context, dir string, run OutputRunner) (bool, error) {
-	out, err := run(ctx, dir, "docker", "compose", "ps", "--format", "json")
+func checkContainers(ctx context.Context, dir, projectName string, run OutputRunner) (bool, error) {
+	out, err := run(ctx, dir, "docker", "compose", "-p", projectName, "ps", "--format", "json")
 	if err != nil {
 		return false, fmt.Errorf("compose ps: %w", err)
 	}

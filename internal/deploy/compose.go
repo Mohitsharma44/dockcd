@@ -32,11 +32,11 @@ func Deploy(ctx context.Context, stack Stack, repoDir string, run CommandRunner)
 		return fmt.Errorf("stack %q: path %q escapes repo directory", stack.Name, stack.Path)
 	}
 
-	if err := run(ctx, dir, "docker", "compose", "pull"); err != nil {
+	if err := run(ctx, dir, "docker", "compose", "-p", stack.Name, "pull"); err != nil {
 		return fmt.Errorf("stack %q: compose pull: %w", stack.Name, err)
 	}
 
-	if err := run(ctx, dir, "docker", "compose", "up", "-d", "--remove-orphans"); err != nil {
+	if err := run(ctx, dir, "docker", "compose", "-p", stack.Name, "up", "-d", "--remove-orphans"); err != nil {
 		return fmt.Errorf("stack %q: compose up: %w", stack.Name, err)
 	}
 

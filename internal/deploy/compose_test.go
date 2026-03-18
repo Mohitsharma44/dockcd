@@ -30,18 +30,18 @@ func TestDeployRunsComposeUp(t *testing.T) {
 	foundPull := false
 	foundUp := false
 	for _, cmd := range ranCommands {
-		if strings.Contains(cmd, "compose pull") {
+		if strings.Contains(cmd, "compose") && strings.Contains(cmd, "pull") {
 			foundPull = true
 		}
-		if strings.Contains(cmd, "compose up") {
+		if strings.Contains(cmd, "compose") && strings.Contains(cmd, "up") {
 			foundUp = true
 		}
 	}
 	if !foundPull {
-		t.Errorf("expected 'docker compose pull', got %v", ranCommands)
+		t.Errorf("expected 'docker compose ... pull', got %v", ranCommands)
 	}
 	if !foundUp {
-		t.Errorf("expected 'docker compose up', got %v", ranCommands)
+		t.Errorf("expected 'docker compose ... up', got %v", ranCommands)
 	}
 }
 
