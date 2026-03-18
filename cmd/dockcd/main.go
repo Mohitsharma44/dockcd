@@ -97,6 +97,14 @@ func execCommand(ctx context.Context, dir string, name string, args ...string) e
 	return nil
 }
 
+// execCommandOutput runs a shell command and returns its output.
+// Used as the production deploy.OutputRunner for health checks.
+func execCommandOutput(ctx context.Context, dir string, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	return cmd.CombinedOutput()
+}
+
 func main() {
 	configPath := flag.String("config", "gitops.yaml", "path to gitops config file")
 	host := flag.String("host", "", "host name (overrides DOCKCD_HOST env and hostname)")
@@ -225,6 +233,7 @@ func main() {
 		PollInterval: *pollInterval,
 		InitialSync:  *initialSync,
 		Runner:       execCommand,
+		OutputRunner: execCommandOutput,
 		Metrics:      m,
 		Status:       status,
 		Logger:       logger,

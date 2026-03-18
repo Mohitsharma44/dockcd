@@ -25,6 +25,9 @@ type Metrics struct {
 
 	// StackHealthy tracks whether each stack is healthy (1) or degraded (0).
 	StackHealthy metric.Float64Gauge
+
+	// RollbackTotal counts rollbacks by result (success/failure).
+	RollbackTotal metric.Int64Counter
 }
 
 // Setup creates an OTel MeterProvider backed by a Prometheus exporter.
@@ -99,6 +102,13 @@ func New(meter metric.Meter) (*Metrics, error) {
 		return nil, err
 	}
 
+	rollbackTotal, err := meter.Int64Counter("dockcd_rollback_total",
+		metric.WithDescription("Total rollbacks by result (success/failure)"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
 		LastSyncTimestamp: lastSync,
 		DeployTotal:       deployTotal,
@@ -106,5 +116,6 @@ func New(meter metric.Meter) (*Metrics, error) {
 		GitLastCommit:     gitLastCommit,
 		PollTotal:         pollTotal,
 		StackHealthy:      stackHealthy,
+		RollbackTotal:     rollbackTotal,
 	}, nil
 }

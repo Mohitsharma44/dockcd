@@ -10,6 +10,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/mohitsharma44/dockcd/internal/config"
 	"github.com/mohitsharma44/dockcd/internal/deploy"
@@ -25,6 +26,9 @@ type GitPoller interface {
 	ChangedStacks(sinceHash string, stackPaths map[string]string) ([]string, error)
 	LastHash() string
 	LoadState() error
+	LastSuccessfulCommit(stack string) string
+	SetLastSuccessfulCommit(stack, hash string) error
+	ExtractAtCommit(commit, pathPrefix, destDir string) error
 }
 
 // Config holds all dependencies for the Reconciler.
@@ -37,6 +41,7 @@ type Config struct {
 	PollInterval time.Duration
 	InitialSync  bool
 	Runner       deploy.CommandRunner
+	OutputRunner deploy.OutputRunner
 	Metrics      *metrics.Metrics
 	Status       *server.Status
 	Logger       *slog.Logger
@@ -53,6 +58,7 @@ type Reconciler struct {
 	pollInterval time.Duration
 	initialSync  bool
 	runner       deploy.CommandRunner
+	outputRunner deploy.OutputRunner
 	metrics      *metrics.Metrics
 	status       *server.Status
 	logger       *slog.Logger
@@ -87,6 +93,7 @@ func New(cfg Config) (*Reconciler, error) {
 		pollInterval: cfg.PollInterval,
 		initialSync:  cfg.InitialSync,
 		runner:       cfg.Runner,
+		outputRunner: cfg.OutputRunner,
 		metrics:      cfg.Metrics,
 		status:       cfg.Status,
 		logger:       logger,
@@ -189,7 +196,8 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	}
 
 	start := time.Now()
-	err = deploy.RunGroups(ctx, groups, r.repoDir, r.runner)
+	commitHash := r.poller.LastHash()
+	err = r.deployGroups(ctx, groups, commitHash)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -207,6 +215,104 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	return nil
 }
 
+// deployGroups deploys groups sequentially, stacks within a group in parallel.
+// Each stack gets health-checked and optionally rolled back on failure.
+func (r *Reconciler) deployGroups(ctx context.Context, groups [][]deploy.Stack, commitHash string) error {
+	for i, group := range groups {
+		g, gCtx := errgroup.WithContext(ctx)
+		for _, stack := range group {
+			g.Go(func() error {
+				return r.deployStack(gCtx, stack, commitHash)
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return fmt.Errorf("group %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+// deployStack deploys a single stack, health-checks it, and rolls back on failure.
+func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commitHash string) error {
+	if err := deploy.Deploy(ctx, stack, r.repoDir, r.runner); err != nil {
+		r.markStackHealth(ctx, stack.Name, false)
+		return err
+	}
+
+	// Health check (skip if no OutputRunner or timeout is 0).
+	if r.outputRunner != nil && stack.HealthCheckTimeout > 0 {
+		dir := filepath.Join(r.repoDir, stack.Path)
+		if err := deploy.HealthCheck(ctx, dir, stack.HealthCheckTimeout, r.outputRunner); err != nil {
+			r.logger.Warn("health check failed",
+				"stack", stack.Name, "error", err)
+
+			if !stack.AutoRollback {
+				r.markStackHealth(ctx, stack.Name, false)
+				return fmt.Errorf("stack %q unhealthy, auto_rollback disabled", stack.Name)
+			}
+
+			return r.rollback(ctx, stack, commitHash)
+		}
+	}
+
+	// Healthy — record successful commit.
+	if err := r.poller.SetLastSuccessfulCommit(stack.Name, commitHash); err != nil {
+		r.logger.Error("failed to save last successful commit", "stack", stack.Name, "error", err)
+	}
+	r.markStackHealth(ctx, stack.Name, true)
+	return nil
+}
+
+// rollback deploys the last known good version of a stack.
+func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCommit string) error {
+	lastGood := r.poller.LastSuccessfulCommit(stack.Name)
+	if lastGood == "" {
+		r.markStackHealth(ctx, stack.Name, false)
+		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		return fmt.Errorf("stack %q: no previous successful commit to rollback to", stack.Name)
+	}
+	if lastGood == currentCommit {
+		r.markStackHealth(ctx, stack.Name, false)
+		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		return fmt.Errorf("stack %q: current commit IS the last successful commit", stack.Name)
+	}
+
+	r.logger.Info("rolling back",
+		"stack", stack.Name,
+		"from_commit", currentCommit,
+		"to_commit", lastGood,
+	)
+
+	tmpDir, err := os.MkdirTemp("", "dockcd-rollback-*")
+	if err != nil {
+		r.markStackHealth(ctx, stack.Name, false)
+		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		return fmt.Errorf("creating temp dir for rollback: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if err := r.poller.ExtractAtCommit(lastGood, stack.Path, tmpDir); err != nil {
+		r.markStackHealth(ctx, stack.Name, false)
+		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		return fmt.Errorf("extracting files at %s: %w", lastGood, err)
+	}
+
+	// Deploy from temp dir using a stack with path "." since files are at root.
+	rollbackStack := deploy.Stack{Name: stack.Name, Path: "."}
+	if err := deploy.Deploy(ctx, rollbackStack, tmpDir, r.runner); err != nil {
+		r.markStackHealth(ctx, stack.Name, false)
+		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		return fmt.Errorf("rollback deploy failed for %q: %w", stack.Name, err)
+	}
+
+	// Rollback succeeded — stack is running but degraded (not at HEAD).
+	r.markStackHealth(ctx, stack.Name, false)
+	r.recordRollbackMetric(ctx, stack.Name, "success")
+	r.logger.Warn("rollback complete, stack is degraded",
+		"stack", stack.Name, "running_commit", lastGood)
+	return nil
+}
+
 // deployAll deploys all configured stacks in dependency order.
 func (r *Reconciler) deployAll(ctx context.Context) error {
 	stacks := r.configToDeployStacks(r.hostStacks)
@@ -218,7 +324,6 @@ func (r *Reconciler) deployAll(ctx context.Context) error {
 }
 
 // buildStackPaths returns a map of stack name → path relative to repo root.
-// Used by ChangedStacks to match git diff output against stack paths.
 func (r *Reconciler) buildStackPaths() map[string]string {
 	paths := make(map[string]string, len(r.hostStacks))
 	for _, s := range r.hostStacks {
@@ -249,9 +354,11 @@ func (r *Reconciler) filterChangedStacks(changedNames []string) []deploy.Stack {
 			}
 		}
 		stacks = append(stacks, deploy.Stack{
-			Name:      cs.Name,
-			Path:      filepath.Join(r.basePath, cs.Path),
-			DependsOn: deps,
+			Name:               cs.Name,
+			Path:               filepath.Join(r.basePath, cs.Path),
+			DependsOn:          deps,
+			HealthCheckTimeout: cs.HealthTimeout(),
+			AutoRollback:       cs.RollbackEnabled(),
 		})
 	}
 	return stacks
@@ -262,9 +369,11 @@ func (r *Reconciler) configToDeployStacks(configStacks []config.Stack) []deploy.
 	stacks := make([]deploy.Stack, len(configStacks))
 	for i, cs := range configStacks {
 		stacks[i] = deploy.Stack{
-			Name:      cs.Name,
-			Path:      filepath.Join(r.basePath, cs.Path),
-			DependsOn: cs.DependsOn,
+			Name:               cs.Name,
+			Path:               filepath.Join(r.basePath, cs.Path),
+			DependsOn:          cs.DependsOn,
+			HealthCheckTimeout: cs.HealthTimeout(),
+			AutoRollback:       cs.RollbackEnabled(),
 		}
 	}
 	return stacks
@@ -309,6 +418,35 @@ func (r *Reconciler) recordGitCommitMetric(ctx context.Context) {
 		otelmetric.WithAttributes(
 			attribute.String("host", r.hostname),
 			attribute.String("commit", r.poller.LastHash()),
+		),
+	)
+}
+
+func (r *Reconciler) markStackHealth(ctx context.Context, stackName string, healthy bool) {
+	if r.metrics == nil {
+		return
+	}
+	val := 0.0
+	if healthy {
+		val = 1.0
+	}
+	r.metrics.StackHealthy.Record(ctx, val,
+		otelmetric.WithAttributes(
+			attribute.String("host", r.hostname),
+			attribute.String("stack", stackName),
+		),
+	)
+}
+
+func (r *Reconciler) recordRollbackMetric(ctx context.Context, stackName, result string) {
+	if r.metrics == nil {
+		return
+	}
+	r.metrics.RollbackTotal.Add(ctx, 1,
+		otelmetric.WithAttributes(
+			attribute.String("host", r.hostname),
+			attribute.String("stack", stackName),
+			attribute.String("result", result),
 		),
 	)
 }

@@ -2,13 +2,16 @@ package reconciler
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mohitsharma44/dockcd/internal/config"
+	"github.com/mohitsharma44/dockcd/internal/deploy"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
 
@@ -22,9 +25,13 @@ type mockPoller struct {
 	changedErr    error
 	lastHash      string
 
-	cloneCalled bool
-	fetchCalled bool
-	loadCalled  bool
+	cloneCalled          bool
+	fetchCalled          bool
+	loadCalled           bool
+	lastSuccessful       map[string]string
+	extractErr           error
+	extractedFiles       map[string]string // path -> content (for rollback tests)
+	setSuccessfulCalled  map[string]string // stack -> hash
 }
 
 func (m *mockPoller) Clone() error {
@@ -47,6 +54,40 @@ func (m *mockPoller) LastHash() string {
 
 func (m *mockPoller) LoadState() error {
 	m.loadCalled = true
+	return nil
+}
+
+func (m *mockPoller) LastSuccessfulCommit(stack string) string {
+	if m.lastSuccessful == nil {
+		return ""
+	}
+	return m.lastSuccessful[stack]
+}
+
+func (m *mockPoller) SetLastSuccessfulCommit(stack, hash string) error {
+	if m.setSuccessfulCalled == nil {
+		m.setSuccessfulCalled = make(map[string]string)
+	}
+	m.setSuccessfulCalled[stack] = hash
+	return nil
+}
+
+func (m *mockPoller) ExtractAtCommit(commit, pathPrefix, destDir string) error {
+	if m.extractErr != nil {
+		return m.extractErr
+	}
+	// Write any configured files to destDir for rollback tests.
+	if m.extractedFiles != nil {
+		for path, content := range m.extractedFiles {
+			fullPath := filepath.Join(destDir, path)
+			if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -492,5 +533,195 @@ func TestFilterChangedStacksReturnsCorrectSet(t *testing.T) {
 
 	if len(names) != 2 || names[0] != "a" || names[1] != "c" {
 		t.Errorf("expected [a, c], got %v", names)
+	}
+}
+
+// --- Health check and rollback tests ---
+
+func TestDeployStackHealthyUpdatesSuccessfulCommit(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	var mu sync.Mutex
+	var calls []deployCall
+	r, _ := testReconciler(t, poller, nil, mockRunner(&mu, &calls))
+
+	// Set up an output runner that reports healthy containers.
+	r.outputRunner = func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte(`{"Name":"web-1","State":"running","Health":"healthy"}` + "\n"), nil
+	}
+
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "docker/stacks/web",
+		HealthCheckTimeout: 10 * time.Second,
+		AutoRollback:       true,
+	}
+
+	err := r.deployStack(context.Background(), stack, "abc123")
+	if err != nil {
+		t.Fatalf("deployStack failed: %v", err)
+	}
+
+	// Should have recorded successful commit.
+	if poller.setSuccessfulCalled["web"] != "abc123" {
+		t.Errorf("expected SetLastSuccessfulCommit(web, abc123), got %v", poller.setSuccessfulCalled)
+	}
+}
+
+func TestDeployStackUnhealthyTriggersRollback(t *testing.T) {
+	poller := &mockPoller{
+		lastHash:       "bad456",
+		lastSuccessful: map[string]string{"web": "good123"},
+		extractedFiles: map[string]string{"compose.yaml": "services:\n  web:\n    image: nginx:old"},
+	}
+	var mu sync.Mutex
+	var calls []deployCall
+	r, _ := testReconciler(t, poller, nil, mockRunner(&mu, &calls))
+
+	// Output runner: first call (health check after deploy) returns unhealthy,
+	// triggering rollback.
+	r.outputRunner = func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte(`{"Name":"web-1","State":"exited","Health":""}` + "\n"), nil
+	}
+
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "docker/stacks/web",
+		HealthCheckTimeout: 1 * time.Millisecond, // very short to trigger timeout fast
+		AutoRollback:       true,
+	}
+
+	err := r.deployStack(context.Background(), stack, "bad456")
+	// Should succeed (rollback completed) — err is nil when rollback works.
+	if err != nil {
+		t.Fatalf("deployStack should succeed after rollback, got: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Should have: deploy pull + deploy up + rollback pull + rollback up = 4 calls.
+	if len(calls) != 4 {
+		t.Fatalf("expected 4 calls (deploy + rollback), got %d: %+v", len(calls), calls)
+	}
+
+	// Should NOT have updated successful commit (rollback means the new commit is bad).
+	if _, ok := poller.setSuccessfulCalled["web"]; ok {
+		t.Error("should not update successful commit after rollback")
+	}
+}
+
+func TestDeployStackNoHistoryNoRollback(t *testing.T) {
+	poller := &mockPoller{
+		lastHash:       "first123",
+		lastSuccessful: map[string]string{}, // no history
+	}
+	var mu sync.Mutex
+	var calls []deployCall
+	r, _ := testReconciler(t, poller, nil, mockRunner(&mu, &calls))
+
+	r.outputRunner = func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte(`{"Name":"web-1","State":"exited","Health":""}` + "\n"), nil
+	}
+
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "docker/stacks/web",
+		HealthCheckTimeout: 1 * time.Millisecond,
+		AutoRollback:       true,
+	}
+
+	err := r.deployStack(context.Background(), stack, "first123")
+	if err == nil {
+		t.Fatal("expected error when no rollback history exists")
+	}
+}
+
+func TestDeployStackRollbackDisabled(t *testing.T) {
+	poller := &mockPoller{
+		lastHash:       "bad456",
+		lastSuccessful: map[string]string{"web": "good123"},
+	}
+	var mu sync.Mutex
+	var calls []deployCall
+	r, _ := testReconciler(t, poller, nil, mockRunner(&mu, &calls))
+
+	r.outputRunner = func(ctx context.Context, dir, name string, args ...string) ([]byte, error) {
+		return []byte(`{"Name":"web-1","State":"exited","Health":""}` + "\n"), nil
+	}
+
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "docker/stacks/web",
+		HealthCheckTimeout: 1 * time.Millisecond,
+		AutoRollback:       false, // disabled
+	}
+
+	err := r.deployStack(context.Background(), stack, "bad456")
+	if err == nil {
+		t.Fatal("expected error when rollback is disabled")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Should only have the initial deploy (2 calls), no rollback.
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 calls (deploy only), got %d", len(calls))
+	}
+}
+
+func TestDeployStackNoHealthCheckSkipsCheck(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	var mu sync.Mutex
+	var calls []deployCall
+	r, _ := testReconciler(t, poller, nil, mockRunner(&mu, &calls))
+
+	// No output runner set — health check should be skipped.
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "docker/stacks/web",
+		HealthCheckTimeout: 60 * time.Second,
+		AutoRollback:       true,
+	}
+
+	err := r.deployStack(context.Background(), stack, "abc123")
+	if err != nil {
+		t.Fatalf("deployStack failed: %v", err)
+	}
+
+	// Should still record successful commit.
+	if poller.setSuccessfulCalled["web"] != "abc123" {
+		t.Errorf("expected SetLastSuccessfulCommit(web, abc123), got %v", poller.setSuccessfulCalled)
+	}
+}
+
+func TestDeployStackDeployFailureNoRollback(t *testing.T) {
+	poller := &mockPoller{
+		lastHash:       "abc123",
+		lastSuccessful: map[string]string{"web": "old123"},
+	}
+
+	// Runner that fails on compose pull.
+	failRunner := func(ctx context.Context, dir, name string, args ...string) error {
+		return fmt.Errorf("compose pull failed")
+	}
+
+	r, _ := testReconciler(t, poller, nil, failRunner)
+
+	stack := deploy.Stack{
+		Name:               "web",
+		Path:               "docker/stacks/web",
+		HealthCheckTimeout: 60 * time.Second,
+		AutoRollback:       true,
+	}
+
+	err := r.deployStack(context.Background(), stack, "abc123")
+	if err == nil {
+		t.Fatal("expected error from failed deploy")
+	}
+
+	// Should NOT have attempted rollback (deploy itself failed).
+	if _, ok := poller.setSuccessfulCalled["web"]; ok {
+		t.Error("should not update successful commit after deploy failure")
 	}
 }

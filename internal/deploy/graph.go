@@ -1,6 +1,9 @@
 package deploy
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // ErrCycleDetected is returned when stacks have circular dependencies.
 var ErrCycleDetected = fmt.Errorf("dependency cycle detected")
@@ -8,9 +11,11 @@ var ErrCycleDetected = fmt.Errorf("dependency cycle detected")
 // Stack is a minimal graph input type, intentionally decoupled from
 // configuration schema types (e.g., internal/config.Stack).
 type Stack struct {
-	Name      string
-	Path      string
-	DependsOn []string
+	Name               string
+	Path               string
+	DependsOn          []string
+	HealthCheckTimeout time.Duration
+	AutoRollback       bool
 }
 
 // BuildGraph takes a list of stacks and returns parallel deployment groups
