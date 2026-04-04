@@ -824,6 +824,80 @@ func TestIntegrationTriggerReconcile(t *testing.T) {
 	}
 }
 
+func TestIntegrationBranchPassedToHookEnv(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+
+	// Use t.Name() in the temp file path to avoid collisions with parallel tests.
+	tmpFile := "/tmp/dockcd-test-branch-" + strings.ReplaceAll(t.Name(), "/", "_")
+	defer os.Remove(tmpFile)
+
+	// Commit compose file and a hook script that writes $DOCKCD_BRANCH to a temp file.
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "add web stack")
+	testutil.CommitFile(t, workDir, "stacks/web/branch-hook.sh",
+		"#!/bin/sh\necho $DOCKCD_BRANCH > "+tmpFile+"\n", "add branch hook")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		return nil
+	}
+
+	stacks := []config.Stack{{
+		Name:   "web",
+		Path:   "stacks/web",
+		Branch: "main",
+		Hooks: &config.Hooks{
+			PreDeploy: &config.HookConfig{
+				Command: "sh branch-hook.sh",
+				Timeout: 5 * time.Second,
+			},
+		},
+	}}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:        poller,
+		HostStacks:    stacks,
+		Hostname:      "integration-test",
+		RepoDir:       cloneDir,
+		DefaultBranch: "main",
+		PollInterval:  100 * time.Millisecond,
+		Runner:        runner,
+		Status:        status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := rec.deployAll(ctx); err != nil {
+		t.Fatalf("deployAll failed: %v", err)
+	}
+
+	// Read the temp file written by the hook and verify it contains "main".
+	data, err := os.ReadFile(tmpFile)
+	if err != nil {
+		t.Fatalf("hook did not write temp file %q: %v", tmpFile, err)
+	}
+	got := strings.TrimSpace(string(data))
+	if got != "main" {
+		t.Errorf("expected DOCKCD_BRANCH=%q, hook wrote %q", "main", got)
+	}
+}
+
 func TestIntegrationStateFileMigration(t *testing.T) {
 	bareDir := testutil.InitBareRepo(t)
 	workDir := testutil.CloneAndSetup(t, bareDir)
