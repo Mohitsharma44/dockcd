@@ -880,3 +880,24 @@ func TestEmitNilEventBus(t *testing.T) {
 	// Should not panic with nil eventBus.
 	r.emit(notify.EventDeploySuccess, "web", "abc", "ok")
 }
+
+func TestResolveStackBranch(t *testing.T) {
+	stacks := []config.Stack{
+		{Name: "traefik", Path: "p/traefik", Branch: "canary"},
+		{Name: "vault", Path: "p/vault"},
+	}
+
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, stacks, nil)
+	r.defaultBranch = "main"
+
+	if got := r.resolveStackBranch("traefik"); got != "canary" {
+		t.Errorf("expected 'canary', got %q", got)
+	}
+	if got := r.resolveStackBranch("vault"); got != "main" {
+		t.Errorf("expected 'main', got %q", got)
+	}
+	if got := r.resolveStackBranch("nonexistent"); got != "main" {
+		t.Errorf("expected 'main' for unknown stack, got %q", got)
+	}
+}

@@ -47,37 +47,39 @@ type GitPoller interface {
 
 // Config holds all dependencies for the Reconciler.
 type Config struct {
-	Poller       GitPoller
-	HostStacks   []config.Stack
-	Hostname     string
-	BasePath     string
-	RepoDir      string
-	PollInterval time.Duration
-	InitialSync  bool
-	Runner       deploy.CommandRunner
-	OutputRunner deploy.OutputRunner
-	Metrics      *metrics.Metrics
-	Status       *server.Status
-	Logger       *slog.Logger
-	EventBus     *notify.EventBus // optional; nil disables event emission
+	Poller        GitPoller
+	HostStacks    []config.Stack
+	Hostname      string
+	BasePath      string
+	RepoDir       string
+	DefaultBranch string
+	PollInterval  time.Duration
+	InitialSync   bool
+	Runner        deploy.CommandRunner
+	OutputRunner  deploy.OutputRunner
+	Metrics       *metrics.Metrics
+	Status        *server.Status
+	Logger        *slog.Logger
+	EventBus      *notify.EventBus // optional; nil disables event emission
 }
 
 // Reconciler is the core loop that polls git for changes and deploys
 // affected stacks in dependency order.
 type Reconciler struct {
-	poller       GitPoller
-	hostStacks   []config.Stack
-	hostname     string
-	basePath     string
-	repoDir      string
-	pollInterval time.Duration
-	initialSync  bool
-	runner       deploy.CommandRunner
-	outputRunner deploy.OutputRunner
-	metrics      *metrics.Metrics
-	status       *server.Status
-	logger       *slog.Logger
-	eventBus     *notify.EventBus
+	poller        GitPoller
+	hostStacks    []config.Stack
+	hostname      string
+	basePath      string
+	repoDir       string
+	defaultBranch string
+	pollInterval  time.Duration
+	initialSync   bool
+	runner        deploy.CommandRunner
+	outputRunner  deploy.OutputRunner
+	metrics       *metrics.Metrics
+	status        *server.Status
+	logger        *slog.Logger
+	eventBus      *notify.EventBus
 }
 
 // New creates a Reconciler from the given config. Returns an error if
@@ -101,19 +103,20 @@ func New(cfg Config) (*Reconciler, error) {
 		logger = slog.Default()
 	}
 	return &Reconciler{
-		poller:       cfg.Poller,
-		hostStacks:   cfg.HostStacks,
-		hostname:     cfg.Hostname,
-		basePath:     cfg.BasePath,
-		repoDir:      cfg.RepoDir,
-		pollInterval: cfg.PollInterval,
-		initialSync:  cfg.InitialSync,
-		runner:       cfg.Runner,
-		outputRunner: cfg.OutputRunner,
-		metrics:      cfg.Metrics,
-		status:       cfg.Status,
-		logger:       logger,
-		eventBus:     cfg.EventBus,
+		poller:        cfg.Poller,
+		hostStacks:    cfg.HostStacks,
+		hostname:      cfg.Hostname,
+		basePath:      cfg.BasePath,
+		repoDir:       cfg.RepoDir,
+		defaultBranch: cfg.DefaultBranch,
+		pollInterval:  cfg.PollInterval,
+		initialSync:   cfg.InitialSync,
+		runner:        cfg.Runner,
+		outputRunner:  cfg.OutputRunner,
+		metrics:       cfg.Metrics,
+		status:        cfg.Status,
+		logger:        logger,
+		eventBus:      cfg.EventBus,
 	}, nil
 }
 
@@ -288,7 +291,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commit
 		StackName: stack.Name,
 		Commit:    commitHash,
 		RepoDir:   r.repoDir,
-		Branch:    "", // populated by multi-branch later
+		Branch:    r.resolveStackBranch(stack.Name),
 	}
 	if err := deploy.Deploy(ctx, stack, r.repoDir, r.runner, env); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
@@ -397,6 +400,18 @@ func (r *Reconciler) deployAll(ctx context.Context) error {
 		return nil // some stacks rolled back but are running
 	}
 	return err
+}
+
+// resolveStackBranch returns the effective branch for a stack.
+// It falls back to the reconciler's defaultBranch if the stack has no
+// explicit branch configured, or if the stack name is not found.
+func (r *Reconciler) resolveStackBranch(stackName string) string {
+	for _, cs := range r.hostStacks {
+		if cs.Name == stackName {
+			return cs.EffectiveBranch(r.defaultBranch)
+		}
+	}
+	return r.defaultBranch
 }
 
 // buildStackPaths returns a map of stack name → path relative to repo root.

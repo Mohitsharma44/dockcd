@@ -248,19 +248,20 @@ func runServe(args []string) int {
 	poller.SetStateFile(filepath.Join(*repoDir, ".dockcd_state"))
 
 	rec, err := reconciler.New(reconciler.Config{
-		Poller:       poller,
-		HostStacks:   hostCfg.Stacks,
-		Hostname:     hostname,
-		BasePath:     cfg.BasePath,
-		RepoDir:      *repoDir,
-		PollInterval: *pollInterval,
-		InitialSync:  *initialSync,
-		Runner:       execCommand,
-		OutputRunner: execCommandOutput,
-		Metrics:      m,
-		Status:       status,
-		Logger:       logger,
-		EventBus:     eventBus,
+		Poller:        poller,
+		HostStacks:    hostCfg.Stacks,
+		Hostname:      hostname,
+		BasePath:      cfg.BasePath,
+		RepoDir:       *repoDir,
+		DefaultBranch: cfg.Branch,
+		PollInterval:  *pollInterval,
+		InitialSync:   *initialSync,
+		Runner:        execCommand,
+		OutputRunner:  execCommandOutput,
+		Metrics:       m,
+		Status:        status,
+		Logger:        logger,
+		EventBus:      eventBus,
 	})
 	if err != nil {
 		logger.Error("failed to create reconciler", "error", err)
