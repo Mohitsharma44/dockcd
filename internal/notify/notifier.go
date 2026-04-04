@@ -96,3 +96,103 @@ func (w *WebhookNotifier) Send(ctx context.Context, event Event) error {
 
 	return nil
 }
+
+// slackAttachment is a single Slack message attachment.
+type slackAttachment struct {
+	Color string `json:"color"`
+	Text  string `json:"text"`
+	Ts    int64  `json:"ts"`
+}
+
+// slackEnvelope is the JSON body sent to a Slack incoming webhook.
+type slackEnvelope struct {
+	Attachments []slackAttachment `json:"attachments"`
+}
+
+// SlackNotifier posts a formatted message to a Slack incoming webhook URL.
+type SlackNotifier struct {
+	name   string
+	url    string
+	client *http.Client
+}
+
+// NewSlackNotifier returns a SlackNotifier that delivers events to the given
+// Slack incoming webhook url. name is used in error messages and returned by
+// Name.
+func NewSlackNotifier(name, url string) *SlackNotifier {
+	return &SlackNotifier{
+		name: name,
+		url:  url,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+	}
+}
+
+// Name returns the configured notifier name.
+func (s *SlackNotifier) Name() string {
+	return s.name
+}
+
+// Send formats event as a Slack attachment and POSTs it to the configured
+// webhook URL. It returns nil on a 2xx response, and a descriptive error
+// otherwise.
+func (s *SlackNotifier) Send(ctx context.Context, event Event) error {
+	commit := event.Commit
+	if len(commit) > 7 {
+		commit = commit[:7]
+	}
+
+	text := fmt.Sprintf("*%s* | stack: `%s` | branch: `%s` | host: `%s` | commit: `%s`",
+		event.Type, event.Stack, event.Branch, event.Host, commit)
+	if event.Message != "" {
+		text += fmt.Sprintf("\n```%s```", event.Message)
+	}
+
+	envelope := slackEnvelope{
+		Attachments: []slackAttachment{
+			{
+				Color: slackColor(event.Type),
+				Text:  text,
+				Ts:    event.Timestamp.Unix(),
+			},
+		},
+	}
+
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return fmt.Errorf("notifier %q: marshal payload: %w", s.name, err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("notifier %q: create request: %w", s.name, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("notifier %q: send request: %w", s.name, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("notifier %q: unexpected status %d", s.name, resp.StatusCode)
+	}
+
+	return nil
+}
+
+// slackColor maps an EventType to a Slack attachment color string.
+func slackColor(et EventType) string {
+	switch et {
+	case EventDeploySuccess, EventReconcileComplete, EventStackResumed:
+		return "good"
+	case EventDeployFailure, EventRollbackFailure, EventHookFailure:
+		return "danger"
+	case EventRollbackSuccess, EventStackSuspended, EventForceDeploy:
+		return "warning"
+	default:
+		return "#439FE0"
+	}
+}
