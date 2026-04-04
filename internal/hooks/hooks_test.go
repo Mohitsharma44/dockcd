@@ -100,7 +100,7 @@ func TestRunTimeout(t *testing.T) {
 		t.Fatal("expected error, got nil")
 	}
 	if !strings.Contains(err.Error(), "context") && !strings.Contains(err.Error(), "timeout") &&
-		!strings.Contains(err.Error(), "signal: killed") {
+		!strings.Contains(err.Error(), "signal: killed") && !strings.Contains(err.Error(), "signal: terminated") {
 		t.Errorf("error = %q, want it to indicate timeout/cancellation", err.Error())
 	}
 	if elapsed > 5*time.Second {

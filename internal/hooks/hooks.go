@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -51,6 +52,14 @@ func Run(ctx context.Context, cfg Config, dir string, env Env) (Result, error) {
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", cfg.Command)
 	cmd.Dir = dir
+
+	// Use a process group so timeout/cancel kills the entire tree,
+	// not just the direct sh process.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 5 * time.Second
 
 	// Inherit parent environment and append DOCKCD_* variables.
 	cmd.Env = append(os.Environ(),
