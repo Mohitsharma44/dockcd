@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/mohitsharma44/dockcd/internal/deploy"
 	"github.com/mohitsharma44/dockcd/internal/hooks"
 	"github.com/mohitsharma44/dockcd/internal/metrics"
+	"github.com/mohitsharma44/dockcd/internal/notify"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
 
@@ -57,6 +59,7 @@ type Config struct {
 	Metrics      *metrics.Metrics
 	Status       *server.Status
 	Logger       *slog.Logger
+	EventBus     *notify.EventBus // optional; nil disables event emission
 }
 
 // Reconciler is the core loop that polls git for changes and deploys
@@ -74,6 +77,7 @@ type Reconciler struct {
 	metrics      *metrics.Metrics
 	status       *server.Status
 	logger       *slog.Logger
+	eventBus     *notify.EventBus
 }
 
 // New creates a Reconciler from the given config. Returns an error if
@@ -109,6 +113,7 @@ func New(cfg Config) (*Reconciler, error) {
 		metrics:      cfg.Metrics,
 		status:       cfg.Status,
 		logger:       logger,
+		eventBus:     cfg.EventBus,
 	}, nil
 }
 
@@ -164,6 +169,7 @@ func (r *Reconciler) initRepo() error {
 // reconcile performs a single poll-and-deploy cycle.
 func (r *Reconciler) reconcile(ctx context.Context) error {
 	prevHash := r.poller.LastHash()
+	r.emit(notify.EventReconcileStart, "", prevHash, "reconcile started")
 
 	changed, err := r.poller.Fetch()
 	if err != nil {
@@ -173,6 +179,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 
 	if !changed {
 		r.recordPollMetric(ctx, "unchanged")
+		r.emit(notify.EventReconcileComplete, "", prevHash, "no changes")
 		return nil
 	}
 
@@ -224,6 +231,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 			"duration", duration,
 			"stacks", changedNames,
 		)
+		r.emit(notify.EventReconcileComplete, "", commitHash, "deploy complete with rollbacks")
 		return nil
 	}
 
@@ -233,6 +241,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		"duration", duration,
 		"stacks", changedNames,
 	)
+	r.emit(notify.EventReconcileComplete, "", commitHash, "deploy complete")
 
 	return nil
 }
@@ -283,6 +292,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commit
 	}
 	if err := deploy.Deploy(ctx, stack, r.repoDir, r.runner, env); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
+		r.emit(notify.EventDeployFailure, stack.Name, commitHash, err.Error())
 		return err
 	}
 
@@ -307,6 +317,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commit
 		r.logger.Error("failed to save last successful commit", "stack", stack.Name, "error", err)
 	}
 	r.markStackHealth(ctx, stack.Name, true)
+	r.emit(notify.EventDeploySuccess, stack.Name, commitHash, "deploy succeeded")
 	return nil
 }
 
@@ -316,11 +327,13 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	if lastGood == "" {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, "no previous successful commit")
 		return fmt.Errorf("stack %q: no previous successful commit to rollback to", stack.Name)
 	}
 	if lastGood == currentCommit {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, "current commit is the last successful commit")
 		return fmt.Errorf("stack %q: current commit IS the last successful commit", stack.Name)
 	}
 
@@ -334,6 +347,7 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	if err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, err.Error())
 		return fmt.Errorf("creating temp dir for rollback: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
@@ -341,6 +355,7 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	if err := r.poller.ExtractAtCommit(lastGood, stack.Path, tmpDir); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, err.Error())
 		return fmt.Errorf("extracting files at %s: %w", lastGood, err)
 	}
 
@@ -354,12 +369,14 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	}); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, err.Error())
 		return fmt.Errorf("rollback deploy failed for %q: %w", stack.Name, err)
 	}
 
 	// Rollback succeeded — stack is running but degraded (not at HEAD).
 	r.markStackHealth(ctx, stack.Name, false)
 	r.recordRollbackMetric(ctx, stack.Name, "success")
+	r.emit(notify.EventRollbackSuccess, stack.Name, lastGood, "rolled back to "+lastGood)
 	r.logger.Warn("rollback complete, stack is degraded",
 		"stack", stack.Name, "running_commit", lastGood)
 	return fmt.Errorf("stack %q: %w to %s", stack.Name, ErrRolledBack, lastGood)
@@ -534,4 +551,96 @@ func (r *Reconciler) recordRollbackMetric(ctx context.Context, stackName, result
 			attribute.String("result", result),
 		),
 	)
+}
+
+// --- Async trigger methods (satisfy server.ReconcileTriggerer) ---
+
+// TriggerReconcile triggers an async reconcile for a single named stack.
+// Returns a unique reconcile ID and an error if the stack is unknown or
+// suspended. The actual deploy runs in a background goroutine.
+func (r *Reconciler) TriggerReconcile(ctx context.Context, stackName string) (string, error) {
+	var found bool
+	for _, s := range r.hostStacks {
+		if s.Name == stackName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("stack %q not found", stackName)
+	}
+	if r.poller.IsSuspended(stackName) {
+		return "", fmt.Errorf("stack %q is suspended", stackName)
+	}
+
+	id := "rec-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	go func() {
+		r.logger.Info("force reconcile triggered", "stack", stackName, "id", id)
+		if _, err := r.poller.Fetch(); err != nil {
+			r.logger.Error("force reconcile fetch failed", "error", err)
+			return
+		}
+		stacks := r.filterStackByName(stackName)
+		if len(stacks) == 0 {
+			return
+		}
+		groups, err := deploy.BuildGraph(stacks)
+		if err != nil {
+			r.logger.Error("force reconcile graph failed", "error", err)
+			return
+		}
+		commitHash := r.poller.LastHash()
+		if err := r.deployGroups(ctx, groups, commitHash); err != nil && !errors.Is(err, ErrRolledBack) {
+			r.logger.Error("force reconcile failed", "error", err)
+		}
+		r.status.Update(time.Now(), commitHash)
+	}()
+
+	return id, nil
+}
+
+// TriggerReconcileAll triggers an async reconcile for all configured stacks.
+// Returns a unique reconcile ID. The actual deploy runs in a background goroutine.
+func (r *Reconciler) TriggerReconcileAll(ctx context.Context) (string, error) {
+	id := "rec-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	go func() {
+		r.logger.Info("force reconcile all triggered", "id", id)
+		if _, err := r.poller.Fetch(); err != nil {
+			r.logger.Error("force reconcile fetch failed", "error", err)
+			return
+		}
+		if err := r.deployAll(ctx); err != nil {
+			r.logger.Error("force reconcile deploy failed", "error", err)
+		}
+		r.status.Update(time.Now(), r.poller.LastHash())
+	}()
+
+	return id, nil
+}
+
+// filterStackByName returns deploy stacks for a single named config stack.
+func (r *Reconciler) filterStackByName(name string) []deploy.Stack {
+	for _, cs := range r.hostStacks {
+		if cs.Name == name {
+			return r.configToDeployStacks([]config.Stack{cs})
+		}
+	}
+	return nil
+}
+
+// emit sends an event to the EventBus. It is a no-op when eventBus is nil.
+func (r *Reconciler) emit(eventType notify.EventType, stack, commit, msg string) {
+	if r.eventBus == nil {
+		return
+	}
+	r.eventBus.Emit(notify.Event{
+		Type:      eventType,
+		Timestamp: time.Now(),
+		Stack:     stack,
+		Host:      r.hostname,
+		Commit:    commit,
+		Message:   msg,
+	})
 }

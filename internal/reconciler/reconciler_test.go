@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mohitsharma44/dockcd/internal/config"
 	"github.com/mohitsharma44/dockcd/internal/deploy"
+	"github.com/mohitsharma44/dockcd/internal/notify"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
 
@@ -814,4 +816,67 @@ func TestReconcileSkipsSuspendedStack(t *testing.T) {
 			t.Errorf("unexpected deploy dir %q: expected only traefik", c.dir)
 		}
 	}
+}
+
+// --- TriggerReconcile / TriggerReconcileAll tests ---
+
+func TestTriggerReconcileNonExistentStack(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, []config.Stack{{Name: "web", Path: "web"}}, nil)
+	_, err := r.TriggerReconcile(context.Background(), "nonexistent")
+	if err == nil {
+		t.Fatal("expected error for nonexistent stack")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected 'not found' error, got: %v", err)
+	}
+}
+
+func TestTriggerReconcileSuspendedStack(t *testing.T) {
+	poller := &mockPoller{
+		lastHash:        "abc123",
+		suspendedStacks: map[string]bool{"web": true},
+	}
+	r, _ := testReconciler(t, poller, []config.Stack{{Name: "web", Path: "web"}}, nil)
+	_, err := r.TriggerReconcile(context.Background(), "web")
+	if err == nil {
+		t.Fatal("expected error for suspended stack")
+	}
+	if !strings.Contains(err.Error(), "suspended") {
+		t.Errorf("expected 'suspended' error, got: %v", err)
+	}
+}
+
+func TestTriggerReconcileReturnsID(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, []config.Stack{{Name: "web", Path: "web"}}, nil)
+	id, err := r.TriggerReconcile(context.Background(), "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == "" {
+		t.Error("expected non-empty ID")
+	}
+	if !strings.HasPrefix(id, "rec-") {
+		t.Errorf("expected 'rec-' prefix, got %q", id)
+	}
+}
+
+func TestTriggerReconcileAllReturnsID(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, []config.Stack{{Name: "web", Path: "web"}}, nil)
+	id, err := r.TriggerReconcileAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(id, "rec-") {
+		t.Errorf("expected 'rec-' prefix, got %q", id)
+	}
+}
+
+func TestEmitNilEventBus(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, nil, nil)
+	// Should not panic with nil eventBus.
+	r.emit(notify.EventDeploySuccess, "web", "abc", "ok")
 }
