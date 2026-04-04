@@ -25,6 +25,7 @@ import (
 	"github.com/mohitsharma44/dockcd/internal/config"
 	"github.com/mohitsharma44/dockcd/internal/git"
 	"github.com/mohitsharma44/dockcd/internal/metrics"
+	"github.com/mohitsharma44/dockcd/internal/notify"
 	"github.com/mohitsharma44/dockcd/internal/reconciler"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
@@ -218,9 +219,9 @@ func runServe(args []string) int {
 		return 1
 	}
 
-	// Setup HTTP server for /metrics and /healthz.
+	// Create shared status and event bus.
 	status := &server.Status{}
-	srv := server.New(fmt.Sprintf(":%d", *metricsPort), status, logger, nil, nil, nil)
+	eventBus := notify.NewEventBus()
 
 	// Create git poller and reconciler.
 	poller := git.NewPoller(cfg.Repo, *repoDir)
@@ -239,11 +240,16 @@ func runServe(args []string) int {
 		Metrics:      m,
 		Status:       status,
 		Logger:       logger,
+		EventBus:     eventBus,
 	})
 	if err != nil {
 		logger.Error("failed to create reconciler", "error", err)
 		return 1
 	}
+
+	// Setup HTTP server for /metrics and /healthz.
+	server.Version = Version
+	srv := server.New(fmt.Sprintf(":%d", *metricsPort), status, logger, poller, rec, eventBus)
 
 	// Start HTTP server in a goroutine (non-blocking).
 	go func() {
@@ -289,6 +295,8 @@ func runServe(args []string) int {
 	if err := tracerProvider.Shutdown(shutdownCtx); err != nil {
 		logger.Error("tracer provider shutdown failed", "error", err)
 	}
+
+	eventBus.Close()
 
 	return exitCode
 }
