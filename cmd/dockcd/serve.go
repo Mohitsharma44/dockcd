@@ -223,6 +223,26 @@ func runServe(args []string) int {
 	status := &server.Status{}
 	eventBus := notify.NewEventBus()
 
+	// Build notifiers from config.
+	var notifierFilters []notify.NotifierWithFilter
+	for _, nc := range cfg.Notifications {
+		var n notify.Notifier
+		switch nc.Type {
+		case "slack":
+			n = notify.NewSlackNotifier(nc.Name, nc.URL)
+		case "webhook":
+			n = notify.NewWebhookNotifier(nc.Name, nc.URL)
+		}
+		events := make(map[notify.EventType]bool, len(nc.Events))
+		for _, e := range nc.Events {
+			events[notify.EventType(e)] = true
+		}
+		notifierFilters = append(notifierFilters, notify.NotifierWithFilter{
+			Notifier: n,
+			Events:   events,
+		})
+	}
+
 	// Create git poller and reconciler.
 	poller := git.NewPoller(cfg.Repo, *repoDir)
 	poller.SetStateFile(filepath.Join(*repoDir, ".dockcd_state"))
@@ -262,6 +282,13 @@ func runServe(args []string) int {
 	// Setup signal handling.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Start notification dispatcher if any notifiers configured.
+	if len(notifierFilters) > 0 {
+		dispatcher := notify.NewDispatcher(eventBus, logger, notifierFilters)
+		go dispatcher.Start(ctx)
+		logger.Info("notification dispatcher started", "notifiers", len(notifierFilters))
+	}
 
 	logger.Info("dockcd starting",
 		"host", hostname,
