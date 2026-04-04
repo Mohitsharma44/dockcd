@@ -695,3 +695,15 @@ hosts:
 		t.Fatalf("expected URL empty error, got %q", err.Error())
 	}
 }
+
+func TestEffectiveBranch(t *testing.T) {
+	s := Stack{Name: "web"}
+	if got := s.EffectiveBranch("main"); got != "main" {
+		t.Errorf("expected 'main', got %q", got)
+	}
+
+	s.Branch = "canary"
+	if got := s.EffectiveBranch("main"); got != "canary" {
+		t.Errorf("expected 'canary', got %q", got)
+	}
+}

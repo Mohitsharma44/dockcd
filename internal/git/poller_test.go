@@ -251,6 +251,55 @@ func TestResumeNotSuspended(t *testing.T) {
 	}
 }
 
+func TestLastHashForBranch(t *testing.T) {
+	dir := t.TempDir()
+	p := NewPoller("", dir)
+	p.state.Branches = map[string]string{"main": "aaa", "canary": "bbb"}
+
+	if got := p.LastHashForBranch("main"); got != "aaa" {
+		t.Errorf("expected 'aaa', got %q", got)
+	}
+	if got := p.LastHashForBranch("canary"); got != "bbb" {
+		t.Errorf("expected 'bbb', got %q", got)
+	}
+	if got := p.LastHashForBranch("unknown"); got != "" {
+		t.Errorf("expected empty, got %q", got)
+	}
+}
+
+func TestSetTrackedBranches(t *testing.T) {
+	p := NewPoller("", t.TempDir())
+	p.SetTrackedBranches([]string{"main", "canary"})
+	if len(p.trackedBranches) != 2 {
+		t.Fatalf("expected 2 tracked branches, got %d", len(p.trackedBranches))
+	}
+}
+
+func TestStateMigrationAddsBranches(t *testing.T) {
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, ".dockcd_state")
+
+	// Old-format state without branches field.
+	data := `{"last_hash":"abc123","last_successful_commits":{"web":"abc123"}}`
+	if err := os.WriteFile(stateFile, []byte(data), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewPoller("", dir)
+	p.SetStateFile(stateFile)
+	p.branch = "main"
+	if err := p.LoadState(); err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+
+	if p.state.Branches == nil {
+		t.Fatal("expected Branches to be initialized")
+	}
+	if p.state.Branches["main"] != "abc123" {
+		t.Errorf("expected Branches[main]='abc123', got %q", p.state.Branches["main"])
+	}
+}
+
 func TestBackwardCompatNoSuspendedField(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "state.json")
 

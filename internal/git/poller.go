@@ -13,26 +13,31 @@ import (
 // State is the JSON-serialized state file format.
 type State struct {
 	LastHash              string            `json:"last_hash"`
+	Branches              map[string]string `json:"branches,omitempty"`
 	LastSuccessfulCommits map[string]string `json:"last_successful_commits"`
 	SuspendedStacks       []string          `json:"suspended_stacks,omitempty"`
 }
 
 type Poller struct {
-	repoURL        string
-	localDir       string
-	lastHash       string
-	stateFile      string
-	branch         string
-	state          State
-	needsReconcile map[string]bool
-	mu             sync.Mutex // protects state and file writes
+	repoURL         string
+	localDir        string
+	lastHash        string
+	stateFile       string
+	branch          string
+	state           State
+	needsReconcile  map[string]bool
+	trackedBranches []string // branches to poll (configured from stack configs)
+	mu              sync.Mutex // protects state and file writes
 }
 
 func NewPoller(repoURL, localDir string) *Poller {
 	return &Poller{
-		repoURL:        repoURL,
-		localDir:       localDir,
-		state:          State{LastSuccessfulCommits: make(map[string]string)},
+		repoURL:  repoURL,
+		localDir: localDir,
+		state: State{
+			LastSuccessfulCommits: make(map[string]string),
+			Branches:              make(map[string]string),
+		},
 		needsReconcile: make(map[string]bool),
 	}
 }
@@ -111,6 +116,13 @@ func (p *Poller) LoadState() error {
 	}
 	if state.LastSuccessfulCommits == nil {
 		state.LastSuccessfulCommits = make(map[string]string)
+	}
+	if state.Branches == nil {
+		state.Branches = make(map[string]string)
+		// Migrate: if an old state had a hash but no Branches map, seed it.
+		if state.LastHash != "" && p.branch != "" {
+			state.Branches[p.branch] = state.LastHash
+		}
 	}
 	p.state = state
 	p.lastHash = state.LastHash
@@ -196,6 +208,29 @@ func (p *Poller) ClearNeedsReconcile(name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.needsReconcile, name)
+}
+
+// SetTrackedBranches configures the set of branches the poller should track.
+func (p *Poller) SetTrackedBranches(branches []string) {
+	p.trackedBranches = branches
+}
+
+// LastHashForBranch returns the last known HEAD hash for the given branch,
+// or empty string if the branch has not been seen yet.
+func (p *Poller) LastHashForBranch(branch string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.state.Branches == nil {
+		return ""
+	}
+	return p.state.Branches[branch]
+}
+
+// ExtractBranchFiles extracts stack files from a non-default branch
+// using git archive, writing to destDir. It delegates to ExtractAtCommit
+// using origin/<branch> as the ref so the working tree is not modified.
+func (p *Poller) ExtractBranchFiles(branch, stackPath, destDir string) error {
+	return p.ExtractAtCommit("origin/"+branch, stackPath, destDir)
 }
 
 // ExtractAtCommit writes the files under pathPrefix at the given commit to destDir.

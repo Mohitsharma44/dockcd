@@ -74,6 +74,15 @@ type Stack struct {
 	Hooks              *Hooks         `yaml:"hooks"`
 }
 
+// EffectiveBranch returns the branch this stack tracks.
+// Falls back to defaultBranch if not explicitly set.
+func (s *Stack) EffectiveBranch(defaultBranch string) string {
+	if s.Branch != "" {
+		return s.Branch
+	}
+	return defaultBranch
+}
+
 // RollbackEnabled returns whether auto-rollback is enabled for this stack.
 // Defaults to true if not explicitly set.
 func (s *Stack) RollbackEnabled() bool {
