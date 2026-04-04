@@ -14,23 +14,26 @@ import (
 type State struct {
 	LastHash              string            `json:"last_hash"`
 	LastSuccessfulCommits map[string]string `json:"last_successful_commits"`
+	SuspendedStacks       []string          `json:"suspended_stacks,omitempty"`
 }
 
 type Poller struct {
-	repoURL   string
-	localDir  string
-	lastHash  string
-	stateFile string
-	branch    string
-	state     State
-	mu        sync.Mutex // protects state and file writes
+	repoURL        string
+	localDir       string
+	lastHash       string
+	stateFile      string
+	branch         string
+	state          State
+	needsReconcile map[string]bool
+	mu             sync.Mutex // protects state and file writes
 }
 
 func NewPoller(repoURL, localDir string) *Poller {
 	return &Poller{
-		repoURL:  repoURL,
-		localDir: localDir,
-		state:    State{LastSuccessfulCommits: make(map[string]string)},
+		repoURL:        repoURL,
+		localDir:       localDir,
+		state:          State{LastSuccessfulCommits: make(map[string]string)},
+		needsReconcile: make(map[string]bool),
 	}
 }
 
@@ -128,6 +131,71 @@ func (p *Poller) SetLastSuccessfulCommit(stack, hash string) error {
 	defer p.mu.Unlock()
 	p.state.LastSuccessfulCommits[stack] = hash
 	return p.saveStateLocked()
+}
+
+// SuspendStack marks a stack as suspended and persists state.
+// Idempotent — suspending an already-suspended stack is a no-op.
+func (p *Poller) SuspendStack(name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, s := range p.state.SuspendedStacks {
+		if s == name {
+			return nil
+		}
+	}
+	p.state.SuspendedStacks = append(p.state.SuspendedStacks, name)
+	return p.saveStateLocked()
+}
+
+// ResumeStack removes a stack from the suspended set, marks it as needing
+// reconcile, and persists state.
+// Idempotent — resuming a non-suspended stack is a no-op.
+func (p *Poller) ResumeStack(name string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	filtered := p.state.SuspendedStacks[:0]
+	found := false
+	for _, s := range p.state.SuspendedStacks {
+		if s == name {
+			found = true
+			continue
+		}
+		filtered = append(filtered, s)
+	}
+	if !found {
+		return nil
+	}
+	p.state.SuspendedStacks = filtered
+	p.needsReconcile[name] = true
+	return p.saveStateLocked()
+}
+
+// IsSuspended returns true if the stack is currently suspended.
+func (p *Poller) IsSuspended(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, s := range p.state.SuspendedStacks {
+		if s == name {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsReconcile returns true if the stack was recently resumed and needs
+// a reconcile pass.
+func (p *Poller) NeedsReconcile(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.needsReconcile[name]
+}
+
+// ClearNeedsReconcile clears the needs-reconcile flag after the stack has
+// been reconciled.
+func (p *Poller) ClearNeedsReconcile(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.needsReconcile, name)
 }
 
 // ExtractAtCommit writes the files under pathPrefix at the given commit to destDir.

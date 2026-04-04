@@ -35,6 +35,11 @@ type GitPoller interface {
 	LastSuccessfulCommit(stack string) string
 	SetLastSuccessfulCommit(stack, hash string) error
 	ExtractAtCommit(commit, pathPrefix, destDir string) error
+	SuspendStack(name string) error
+	ResumeStack(name string) error
+	IsSuspended(name string) bool
+	NeedsReconcile(name string) bool
+	ClearNeedsReconcile(name string)
 }
 
 // Config holds all dependencies for the Reconciler.
@@ -385,6 +390,10 @@ func (r *Reconciler) filterChangedStacks(changedNames []string) []deploy.Stack {
 	var stacks []deploy.Stack
 	for _, cs := range r.hostStacks {
 		if !changedSet[cs.Name] {
+			continue
+		}
+		if r.poller.IsSuspended(cs.Name) {
+			r.logger.Info("skipping suspended stack", "stack", cs.Name)
 			continue
 		}
 		// Only keep deps that are also being deployed.
