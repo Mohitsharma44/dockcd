@@ -220,7 +220,7 @@ func runServe(args []string) int {
 
 	// Setup HTTP server for /metrics and /healthz.
 	status := &server.Status{}
-	srv := server.New(fmt.Sprintf(":%d", *metricsPort), status, logger)
+	srv := server.New(fmt.Sprintf(":%d", *metricsPort), status, logger, nil, nil, nil)
 
 	// Create git poller and reconciler.
 	poller := git.NewPoller(cfg.Repo, *repoDir)
