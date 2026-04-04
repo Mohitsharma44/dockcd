@@ -360,8 +360,9 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	}
 
 	// Deploy from temp dir using a stack with path "." since files are at root.
-	// No hooks on rollback deploys — hooks only run on forward deploys.
-	rollbackStack := deploy.Stack{Name: stack.Name, Path: "."}
+	// Pre-deploy hooks run again during rollback — the old commit's files
+	// may also need decryption (e.g., SOPS-encrypted .env files).
+	rollbackStack := deploy.Stack{Name: stack.Name, Path: ".", PreDeployHook: stack.PreDeployHook}
 	if err := deploy.Deploy(ctx, rollbackStack, tmpDir, r.runner, hooks.Env{
 		StackName: stack.Name,
 		Commit:    lastGood,
@@ -575,6 +576,10 @@ func (r *Reconciler) TriggerReconcile(ctx context.Context, stackName string) (st
 
 	id := "rec-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 
+	// Use a detached context — the caller's context (HTTP request) will be
+	// cancelled when the handler returns, but the background deploy must continue.
+	bgCtx := context.WithoutCancel(ctx)
+
 	go func() {
 		r.logger.Info("force reconcile triggered", "stack", stackName, "id", id)
 		if _, err := r.poller.Fetch(); err != nil {
@@ -591,7 +596,7 @@ func (r *Reconciler) TriggerReconcile(ctx context.Context, stackName string) (st
 			return
 		}
 		commitHash := r.poller.LastHash()
-		if err := r.deployGroups(ctx, groups, commitHash); err != nil && !errors.Is(err, ErrRolledBack) {
+		if err := r.deployGroups(bgCtx, groups, commitHash); err != nil && !errors.Is(err, ErrRolledBack) {
 			r.logger.Error("force reconcile failed", "error", err)
 		}
 		r.status.Update(time.Now(), commitHash)
@@ -605,13 +610,17 @@ func (r *Reconciler) TriggerReconcile(ctx context.Context, stackName string) (st
 func (r *Reconciler) TriggerReconcileAll(ctx context.Context) (string, error) {
 	id := "rec-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 
+	// Use a detached context — the caller's context (HTTP request) will be
+	// cancelled when the handler returns, but the background deploy must continue.
+	bgCtx := context.WithoutCancel(ctx)
+
 	go func() {
 		r.logger.Info("force reconcile all triggered", "id", id)
 		if _, err := r.poller.Fetch(); err != nil {
 			r.logger.Error("force reconcile fetch failed", "error", err)
 			return
 		}
-		if err := r.deployAll(ctx); err != nil {
+		if err := r.deployAll(bgCtx); err != nil {
 			r.logger.Error("force reconcile deploy failed", "error", err)
 		}
 		r.status.Update(time.Now(), r.poller.LastHash())
