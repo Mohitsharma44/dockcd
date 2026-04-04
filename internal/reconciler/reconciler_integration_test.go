@@ -471,6 +471,359 @@ func TestIntegrationNoHistoryNoRollback(t *testing.T) {
 	}
 }
 
+func TestIntegrationPreDeployHookRuns(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+
+	// Commit both the compose file and a hook script into the stack directory.
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "add web stack")
+	testutil.CommitFile(t, workDir, "stacks/web/hook.sh",
+		"#!/bin/sh\necho hook ran\n", "add hook script")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		return nil
+	}
+
+	stacks := []config.Stack{{
+		Name: "web",
+		Path: "stacks/web",
+		Hooks: &config.Hooks{
+			PreDeploy: &config.HookConfig{
+				Command: "sh hook.sh",
+				Timeout: 5 * time.Second,
+			},
+		},
+	}}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:       poller,
+		HostStacks:   stacks,
+		Hostname:     "integration-test",
+		RepoDir:      cloneDir,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		Status:       status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := rec.deployAll(ctx); err != nil {
+		t.Fatalf("deployAll failed (hook should have succeeded): %v", err)
+	}
+
+	// The hook runs via hooks.Run (not the recording runner), so we verify
+	// compose was invoked — meaning the hook succeeded and did not block compose.
+	mu.Lock()
+	n := len(calls)
+	mu.Unlock()
+
+	// 1 stack × 2 commands (pull + up) = 2 calls.
+	if n != 2 {
+		t.Fatalf("expected 2 compose calls (hook ran, compose proceeded), got %d", n)
+	}
+}
+
+func TestIntegrationPreDeployHookFailurePreventsCompose(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "add web stack")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		return nil
+	}
+
+	stacks := []config.Stack{{
+		Name: "web",
+		Path: "stacks/web",
+		Hooks: &config.Hooks{
+			PreDeploy: &config.HookConfig{
+				Command: "exit 1",
+				Timeout: 5 * time.Second,
+			},
+		},
+	}}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:       poller,
+		HostStacks:   stacks,
+		Hostname:     "integration-test",
+		RepoDir:      cloneDir,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		Status:       status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := rec.deployAll(ctx); err == nil {
+		t.Fatal("expected deployAll to return error when pre-deploy hook fails")
+	}
+
+	// Hook failed — compose must never have been called.
+	mu.Lock()
+	n := len(calls)
+	mu.Unlock()
+
+	if n != 0 {
+		t.Fatalf("expected 0 compose calls when hook fails, got %d", n)
+	}
+}
+
+func TestIntegrationSuspendSkipsStack(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "add web stack")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		return nil
+	}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:       poller,
+		HostStacks:   []config.Stack{{Name: "web", Path: "stacks/web"}},
+		Hostname:     "integration-test",
+		RepoDir:      cloneDir,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		Status:       status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	// Suspend the stack before any reconcile.
+	if err := poller.SuspendStack("web"); err != nil {
+		t.Fatalf("SuspendStack failed: %v", err)
+	}
+
+	// Push a change so reconcile sees a diff.
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx:alpine", "update web stack")
+
+	ctx := context.Background()
+	if err := rec.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	// Stack is suspended — no compose calls expected.
+	mu.Lock()
+	n := len(calls)
+	mu.Unlock()
+
+	if n != 0 {
+		t.Fatalf("expected 0 compose calls for suspended stack, got %d", n)
+	}
+}
+
+func TestIntegrationResumeDeploysStack(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "add web stack")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		return nil
+	}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:       poller,
+		HostStacks:   []config.Stack{{Name: "web", Path: "stacks/web"}},
+		Hostname:     "integration-test",
+		RepoDir:      cloneDir,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		Status:       status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	// Suspend the stack before any reconcile.
+	if err := poller.SuspendStack("web"); err != nil {
+		t.Fatalf("SuspendStack failed: %v", err)
+	}
+
+	// Push a change while suspended.
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx:alpine", "update web stack")
+
+	ctx := context.Background()
+
+	// First reconcile — stack is suspended, should skip.
+	if err := rec.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile (suspended) failed: %v", err)
+	}
+
+	mu.Lock()
+	nAfterSuspend := len(calls)
+	mu.Unlock()
+
+	if nAfterSuspend != 0 {
+		t.Fatalf("expected 0 compose calls while suspended, got %d", nAfterSuspend)
+	}
+
+	// Resume the stack.
+	if err := poller.ResumeStack("web"); err != nil {
+		t.Fatalf("ResumeStack failed: %v", err)
+	}
+
+	// Second reconcile — the previously-fetched change is already the current
+	// tip, so we push another commit to ensure reconcile detects a diff.
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx:latest", "post-resume update")
+
+	if err := rec.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile (after resume) failed: %v", err)
+	}
+
+	mu.Lock()
+	nAfterResume := len(calls)
+	mu.Unlock()
+
+	// 1 stack × 2 commands (pull + up) = 2 calls.
+	if nAfterResume != 2 {
+		t.Fatalf("expected 2 compose calls after resume, got %d", nAfterResume)
+	}
+}
+
+func TestIntegrationTriggerReconcile(t *testing.T) {
+	bareDir := testutil.InitBareRepo(t)
+	workDir := testutil.CloneAndSetup(t, bareDir)
+	testutil.CommitFile(t, workDir, "stacks/web/compose.yaml",
+		"services:\n  web:\n    image: nginx", "add web stack")
+
+	cloneDir := filepath.Join(t.TempDir(), "dockcd-clone")
+	poller := git.NewPoller(bareDir, cloneDir)
+	poller.SetStateFile(filepath.Join(cloneDir, ".dockcd_state"))
+
+	// Use a channel to signal when the async deploy has finished.
+	done := make(chan struct{})
+	var mu sync.Mutex
+	var calls []deployCall
+	runner := func(ctx context.Context, dir, name string, args ...string) error {
+		mu.Lock()
+		calls = append(calls, deployCall{dir: dir, name: name, args: args})
+		n := len(calls)
+		mu.Unlock()
+		// 1 stack × 2 commands (pull + up) = 2 calls.
+		if n >= 2 {
+			select {
+			case <-done: // already closed
+			default:
+				close(done)
+			}
+		}
+		return nil
+	}
+
+	status := &server.Status{}
+	rec, err := New(Config{
+		Poller:       poller,
+		HostStacks:   []config.Stack{{Name: "web", Path: "stacks/web"}},
+		Hostname:     "integration-test",
+		RepoDir:      cloneDir,
+		PollInterval: 100 * time.Millisecond,
+		Runner:       runner,
+		Status:       status,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	if err := rec.initRepo(); err != nil {
+		t.Fatalf("initRepo failed: %v", err)
+	}
+
+	ctx := context.Background()
+	id, err := rec.TriggerReconcile(ctx, "web")
+	if err != nil {
+		t.Fatalf("TriggerReconcile failed: %v", err)
+	}
+	if id == "" {
+		t.Fatal("expected non-empty reconcile ID")
+	}
+
+	// Wait for the async goroutine to finish, with a generous timeout.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("TriggerReconcile goroutine did not complete in time")
+	}
+
+	mu.Lock()
+	n := len(calls)
+	mu.Unlock()
+
+	// Expect pull + up = 2 calls.
+	if n != 2 {
+		t.Fatalf("expected 2 compose calls from TriggerReconcile, got %d", n)
+	}
+}
+
 func TestIntegrationStateFileMigration(t *testing.T) {
 	bareDir := testutil.InitBareRepo(t)
 	workDir := testutil.CloneAndSetup(t, bareDir)
