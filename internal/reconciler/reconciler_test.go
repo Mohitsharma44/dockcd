@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/mohitsharma44/dockcd/internal/config"
 	"github.com/mohitsharma44/dockcd/internal/deploy"
+	"github.com/mohitsharma44/dockcd/internal/notify"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
 
@@ -35,6 +37,8 @@ type mockPoller struct {
 	extractedFiles       map[string]string // path -> content (for rollback tests)
 	mu                   sync.Mutex
 	setSuccessfulCalled  map[string]string // stack -> hash
+	suspendedStacks      map[string]bool
+	needsReconcileSet    map[string]bool
 }
 
 func (m *mockPoller) Clone() error {
@@ -96,6 +100,49 @@ func (m *mockPoller) ExtractAtCommit(commit, pathPrefix, destDir string) error {
 		}
 	}
 	return nil
+}
+
+func (m *mockPoller) SuspendStack(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.suspendedStacks == nil {
+		m.suspendedStacks = make(map[string]bool)
+	}
+	m.suspendedStacks[name] = true
+	return nil
+}
+
+func (m *mockPoller) ResumeStack(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.suspendedStacks != nil {
+		delete(m.suspendedStacks, name)
+	}
+	if m.needsReconcileSet == nil {
+		m.needsReconcileSet = make(map[string]bool)
+	}
+	m.needsReconcileSet[name] = true
+	return nil
+}
+
+func (m *mockPoller) IsSuspended(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.suspendedStacks[name]
+}
+
+func (m *mockPoller) NeedsReconcile(name string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.needsReconcileSet[name]
+}
+
+func (m *mockPoller) ClearNeedsReconcile(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.needsReconcileSet != nil {
+		delete(m.needsReconcileSet, name)
+	}
 }
 
 // --- Mock CommandRunner ---
@@ -730,5 +777,127 @@ func TestDeployStackDeployFailureNoRollback(t *testing.T) {
 	// Should NOT have attempted rollback (deploy itself failed).
 	if _, ok := poller.setSuccessfulCalled["web"]; ok {
 		t.Error("should not update successful commit after deploy failure")
+	}
+}
+
+func TestReconcileSkipsSuspendedStack(t *testing.T) {
+	stacks := []config.Stack{
+		{Name: "traefik", Path: "server04/traefik"},
+		{Name: "vault", Path: "server04/vault"},
+	}
+
+	poller := &mockPoller{
+		fetchChanged:  true,
+		lastHash:      "def456",
+		changedStacks: []string{"traefik", "vault"},
+		// vault is suspended
+		suspendedStacks: map[string]bool{"vault": true},
+	}
+
+	var mu sync.Mutex
+	var calls []deployCall
+	r, _ := testReconciler(t, poller, stacks, mockRunner(&mu, &calls))
+
+	if err := r.reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Only traefik should be deployed: 2 calls (pull + up).
+	// vault is suspended and must be skipped.
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 deploy calls (traefik only), got %d: %+v", len(calls), calls)
+	}
+
+	for _, c := range calls {
+		if c.dir != "/opt/repo/docker/stacks/server04/traefik" {
+			t.Errorf("unexpected deploy dir %q: expected only traefik", c.dir)
+		}
+	}
+}
+
+// --- TriggerReconcile / TriggerReconcileAll tests ---
+
+func TestTriggerReconcileNonExistentStack(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, []config.Stack{{Name: "web", Path: "web"}}, nil)
+	_, err := r.TriggerReconcile(context.Background(), "nonexistent")
+	if err == nil {
+		t.Fatal("expected error for nonexistent stack")
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected 'not found' error, got: %v", err)
+	}
+}
+
+func TestTriggerReconcileSuspendedStack(t *testing.T) {
+	poller := &mockPoller{
+		lastHash:        "abc123",
+		suspendedStacks: map[string]bool{"web": true},
+	}
+	r, _ := testReconciler(t, poller, []config.Stack{{Name: "web", Path: "web"}}, nil)
+	_, err := r.TriggerReconcile(context.Background(), "web")
+	if err == nil {
+		t.Fatal("expected error for suspended stack")
+	}
+	if !strings.Contains(err.Error(), "suspended") {
+		t.Errorf("expected 'suspended' error, got: %v", err)
+	}
+}
+
+func TestTriggerReconcileReturnsID(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, []config.Stack{{Name: "web", Path: "web"}}, nil)
+	id, err := r.TriggerReconcile(context.Background(), "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id == "" {
+		t.Error("expected non-empty ID")
+	}
+	if !strings.HasPrefix(id, "rec-") {
+		t.Errorf("expected 'rec-' prefix, got %q", id)
+	}
+}
+
+func TestTriggerReconcileAllReturnsID(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, []config.Stack{{Name: "web", Path: "web"}}, nil)
+	id, err := r.TriggerReconcileAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(id, "rec-") {
+		t.Errorf("expected 'rec-' prefix, got %q", id)
+	}
+}
+
+func TestEmitNilEventBus(t *testing.T) {
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, nil, nil)
+	// Should not panic with nil eventBus.
+	r.emit(notify.EventDeploySuccess, "web", "abc", "ok")
+}
+
+func TestResolveStackBranch(t *testing.T) {
+	stacks := []config.Stack{
+		{Name: "traefik", Path: "p/traefik", Branch: "canary"},
+		{Name: "vault", Path: "p/vault"},
+	}
+
+	poller := &mockPoller{lastHash: "abc123"}
+	r, _ := testReconciler(t, poller, stacks, nil)
+	r.defaultBranch = "main"
+
+	if got := r.resolveStackBranch("traefik"); got != "canary" {
+		t.Errorf("expected 'canary', got %q", got)
+	}
+	if got := r.resolveStackBranch("vault"); got != "main" {
+		t.Errorf("expected 'main', got %q", got)
+	}
+	if got := r.resolveStackBranch("nonexistent"); got != "main" {
+		t.Errorf("expected 'main' for unknown stack, got %q", got)
 	}
 }

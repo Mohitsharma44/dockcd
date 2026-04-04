@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -16,7 +17,9 @@ import (
 
 	"github.com/mohitsharma44/dockcd/internal/config"
 	"github.com/mohitsharma44/dockcd/internal/deploy"
+	"github.com/mohitsharma44/dockcd/internal/hooks"
 	"github.com/mohitsharma44/dockcd/internal/metrics"
+	"github.com/mohitsharma44/dockcd/internal/notify"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
 
@@ -35,39 +38,48 @@ type GitPoller interface {
 	LastSuccessfulCommit(stack string) string
 	SetLastSuccessfulCommit(stack, hash string) error
 	ExtractAtCommit(commit, pathPrefix, destDir string) error
+	SuspendStack(name string) error
+	ResumeStack(name string) error
+	IsSuspended(name string) bool
+	NeedsReconcile(name string) bool
+	ClearNeedsReconcile(name string)
 }
 
 // Config holds all dependencies for the Reconciler.
 type Config struct {
-	Poller       GitPoller
-	HostStacks   []config.Stack
-	Hostname     string
-	BasePath     string
-	RepoDir      string
-	PollInterval time.Duration
-	InitialSync  bool
-	Runner       deploy.CommandRunner
-	OutputRunner deploy.OutputRunner
-	Metrics      *metrics.Metrics
-	Status       *server.Status
-	Logger       *slog.Logger
+	Poller        GitPoller
+	HostStacks    []config.Stack
+	Hostname      string
+	BasePath      string
+	RepoDir       string
+	DefaultBranch string
+	PollInterval  time.Duration
+	InitialSync   bool
+	Runner        deploy.CommandRunner
+	OutputRunner  deploy.OutputRunner
+	Metrics       *metrics.Metrics
+	Status        *server.Status
+	Logger        *slog.Logger
+	EventBus      *notify.EventBus // optional; nil disables event emission
 }
 
 // Reconciler is the core loop that polls git for changes and deploys
 // affected stacks in dependency order.
 type Reconciler struct {
-	poller       GitPoller
-	hostStacks   []config.Stack
-	hostname     string
-	basePath     string
-	repoDir      string
-	pollInterval time.Duration
-	initialSync  bool
-	runner       deploy.CommandRunner
-	outputRunner deploy.OutputRunner
-	metrics      *metrics.Metrics
-	status       *server.Status
-	logger       *slog.Logger
+	poller        GitPoller
+	hostStacks    []config.Stack
+	hostname      string
+	basePath      string
+	repoDir       string
+	defaultBranch string
+	pollInterval  time.Duration
+	initialSync   bool
+	runner        deploy.CommandRunner
+	outputRunner  deploy.OutputRunner
+	metrics       *metrics.Metrics
+	status        *server.Status
+	logger        *slog.Logger
+	eventBus      *notify.EventBus
 }
 
 // New creates a Reconciler from the given config. Returns an error if
@@ -91,18 +103,20 @@ func New(cfg Config) (*Reconciler, error) {
 		logger = slog.Default()
 	}
 	return &Reconciler{
-		poller:       cfg.Poller,
-		hostStacks:   cfg.HostStacks,
-		hostname:     cfg.Hostname,
-		basePath:     cfg.BasePath,
-		repoDir:      cfg.RepoDir,
-		pollInterval: cfg.PollInterval,
-		initialSync:  cfg.InitialSync,
-		runner:       cfg.Runner,
-		outputRunner: cfg.OutputRunner,
-		metrics:      cfg.Metrics,
-		status:       cfg.Status,
-		logger:       logger,
+		poller:        cfg.Poller,
+		hostStacks:    cfg.HostStacks,
+		hostname:      cfg.Hostname,
+		basePath:      cfg.BasePath,
+		repoDir:       cfg.RepoDir,
+		defaultBranch: cfg.DefaultBranch,
+		pollInterval:  cfg.PollInterval,
+		initialSync:   cfg.InitialSync,
+		runner:        cfg.Runner,
+		outputRunner:  cfg.OutputRunner,
+		metrics:       cfg.Metrics,
+		status:        cfg.Status,
+		logger:        logger,
+		eventBus:      cfg.EventBus,
 	}, nil
 }
 
@@ -158,6 +172,7 @@ func (r *Reconciler) initRepo() error {
 // reconcile performs a single poll-and-deploy cycle.
 func (r *Reconciler) reconcile(ctx context.Context) error {
 	prevHash := r.poller.LastHash()
+	r.emit(notify.EventReconcileStart, "", prevHash, "reconcile started")
 
 	changed, err := r.poller.Fetch()
 	if err != nil {
@@ -167,6 +182,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 
 	if !changed {
 		r.recordPollMetric(ctx, "unchanged")
+		r.emit(notify.EventReconcileComplete, "", prevHash, "no changes")
 		return nil
 	}
 
@@ -218,6 +234,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 			"duration", duration,
 			"stacks", changedNames,
 		)
+		r.emit(notify.EventReconcileComplete, "", commitHash, "deploy complete with rollbacks")
 		return nil
 	}
 
@@ -227,6 +244,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		"duration", duration,
 		"stacks", changedNames,
 	)
+	r.emit(notify.EventReconcileComplete, "", commitHash, "deploy complete")
 
 	return nil
 }
@@ -269,8 +287,15 @@ func (r *Reconciler) deployGroups(ctx context.Context, groups [][]deploy.Stack, 
 
 // deployStack deploys a single stack, health-checks it, and rolls back on failure.
 func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commitHash string) error {
-	if err := deploy.Deploy(ctx, stack, r.repoDir, r.runner); err != nil {
+	env := hooks.Env{
+		StackName: stack.Name,
+		Commit:    commitHash,
+		RepoDir:   r.repoDir,
+		Branch:    r.resolveStackBranch(stack.Name),
+	}
+	if err := deploy.Deploy(ctx, stack, r.repoDir, r.runner, env); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
+		r.emit(notify.EventDeployFailure, stack.Name, commitHash, err.Error())
 		return err
 	}
 
@@ -295,6 +320,7 @@ func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commit
 		r.logger.Error("failed to save last successful commit", "stack", stack.Name, "error", err)
 	}
 	r.markStackHealth(ctx, stack.Name, true)
+	r.emit(notify.EventDeploySuccess, stack.Name, commitHash, "deploy succeeded")
 	return nil
 }
 
@@ -304,11 +330,13 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	if lastGood == "" {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, "no previous successful commit")
 		return fmt.Errorf("stack %q: no previous successful commit to rollback to", stack.Name)
 	}
 	if lastGood == currentCommit {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, "current commit is the last successful commit")
 		return fmt.Errorf("stack %q: current commit IS the last successful commit", stack.Name)
 	}
 
@@ -322,6 +350,7 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	if err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, err.Error())
 		return fmt.Errorf("creating temp dir for rollback: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
@@ -329,20 +358,29 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	if err := r.poller.ExtractAtCommit(lastGood, stack.Path, tmpDir); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, err.Error())
 		return fmt.Errorf("extracting files at %s: %w", lastGood, err)
 	}
 
 	// Deploy from temp dir using a stack with path "." since files are at root.
-	rollbackStack := deploy.Stack{Name: stack.Name, Path: "."}
-	if err := deploy.Deploy(ctx, rollbackStack, tmpDir, r.runner); err != nil {
+	// Pre-deploy hooks run again during rollback — the old commit's files
+	// may also need decryption (e.g., SOPS-encrypted .env files).
+	rollbackStack := deploy.Stack{Name: stack.Name, Path: ".", PreDeployHook: stack.PreDeployHook}
+	if err := deploy.Deploy(ctx, rollbackStack, tmpDir, r.runner, hooks.Env{
+		StackName: stack.Name,
+		Commit:    lastGood,
+		RepoDir:   r.repoDir,
+	}); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
+		r.emit(notify.EventRollbackFailure, stack.Name, currentCommit, err.Error())
 		return fmt.Errorf("rollback deploy failed for %q: %w", stack.Name, err)
 	}
 
 	// Rollback succeeded — stack is running but degraded (not at HEAD).
 	r.markStackHealth(ctx, stack.Name, false)
 	r.recordRollbackMetric(ctx, stack.Name, "success")
+	r.emit(notify.EventRollbackSuccess, stack.Name, lastGood, "rolled back to "+lastGood)
 	r.logger.Warn("rollback complete, stack is degraded",
 		"stack", stack.Name, "running_commit", lastGood)
 	return fmt.Errorf("stack %q: %w to %s", stack.Name, ErrRolledBack, lastGood)
@@ -364,6 +402,18 @@ func (r *Reconciler) deployAll(ctx context.Context) error {
 	return err
 }
 
+// resolveStackBranch returns the effective branch for a stack.
+// It falls back to the reconciler's defaultBranch if the stack has no
+// explicit branch configured, or if the stack name is not found.
+func (r *Reconciler) resolveStackBranch(stackName string) string {
+	for _, cs := range r.hostStacks {
+		if cs.Name == stackName {
+			return cs.EffectiveBranch(r.defaultBranch)
+		}
+	}
+	return r.defaultBranch
+}
+
 // buildStackPaths returns a map of stack name → path relative to repo root.
 func (r *Reconciler) buildStackPaths() map[string]string {
 	paths := make(map[string]string, len(r.hostStacks))
@@ -371,6 +421,15 @@ func (r *Reconciler) buildStackPaths() map[string]string {
 		paths[s.Name] = filepath.Join(r.basePath, s.Path)
 	}
 	return paths
+}
+
+// configHookToDeployHook converts a config.HookConfig to a hooks.Config.
+// Returns nil if h is nil.
+func configHookToDeployHook(h *config.HookConfig) *hooks.Config {
+	if h == nil {
+		return nil
+	}
+	return &hooks.Config{Command: h.Command, Timeout: h.Timeout}
 }
 
 // filterChangedStacks converts config stacks to deploy stacks, including
@@ -387,6 +446,10 @@ func (r *Reconciler) filterChangedStacks(changedNames []string) []deploy.Stack {
 		if !changedSet[cs.Name] {
 			continue
 		}
+		if r.poller.IsSuspended(cs.Name) {
+			r.logger.Info("skipping suspended stack", "stack", cs.Name)
+			continue
+		}
 		// Only keep deps that are also being deployed.
 		var deps []string
 		for _, d := range cs.DependsOn {
@@ -394,12 +457,19 @@ func (r *Reconciler) filterChangedStacks(changedNames []string) []deploy.Stack {
 				deps = append(deps, d)
 			}
 		}
+		var preHook, postHook *hooks.Config
+		if cs.Hooks != nil {
+			preHook = configHookToDeployHook(cs.Hooks.PreDeploy)
+			postHook = configHookToDeployHook(cs.Hooks.PostDeploy)
+		}
 		stacks = append(stacks, deploy.Stack{
 			Name:               cs.Name,
 			Path:               filepath.Join(r.basePath, cs.Path),
 			DependsOn:          deps,
 			HealthCheckTimeout: cs.HealthTimeout(),
 			AutoRollback:       cs.RollbackEnabled(),
+			PreDeployHook:      preHook,
+			PostDeployHook:     postHook,
 		})
 	}
 	return stacks
@@ -409,12 +479,19 @@ func (r *Reconciler) filterChangedStacks(changedNames []string) []deploy.Stack {
 func (r *Reconciler) configToDeployStacks(configStacks []config.Stack) []deploy.Stack {
 	stacks := make([]deploy.Stack, len(configStacks))
 	for i, cs := range configStacks {
+		var preHook, postHook *hooks.Config
+		if cs.Hooks != nil {
+			preHook = configHookToDeployHook(cs.Hooks.PreDeploy)
+			postHook = configHookToDeployHook(cs.Hooks.PostDeploy)
+		}
 		stacks[i] = deploy.Stack{
 			Name:               cs.Name,
 			Path:               filepath.Join(r.basePath, cs.Path),
 			DependsOn:          cs.DependsOn,
 			HealthCheckTimeout: cs.HealthTimeout(),
 			AutoRollback:       cs.RollbackEnabled(),
+			PreDeployHook:      preHook,
+			PostDeployHook:     postHook,
 		}
 	}
 	return stacks
@@ -490,4 +567,104 @@ func (r *Reconciler) recordRollbackMetric(ctx context.Context, stackName, result
 			attribute.String("result", result),
 		),
 	)
+}
+
+// --- Async trigger methods (satisfy server.ReconcileTriggerer) ---
+
+// TriggerReconcile triggers an async reconcile for a single named stack.
+// Returns a unique reconcile ID and an error if the stack is unknown or
+// suspended. The actual deploy runs in a background goroutine.
+func (r *Reconciler) TriggerReconcile(ctx context.Context, stackName string) (string, error) {
+	var found bool
+	for _, s := range r.hostStacks {
+		if s.Name == stackName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("stack %q not found", stackName)
+	}
+	if r.poller.IsSuspended(stackName) {
+		return "", fmt.Errorf("stack %q is suspended", stackName)
+	}
+
+	id := "rec-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	// Use a detached context — the caller's context (HTTP request) will be
+	// cancelled when the handler returns, but the background deploy must continue.
+	bgCtx := context.WithoutCancel(ctx)
+
+	go func() {
+		r.logger.Info("force reconcile triggered", "stack", stackName, "id", id)
+		if _, err := r.poller.Fetch(); err != nil {
+			r.logger.Error("force reconcile fetch failed", "error", err)
+			return
+		}
+		stacks := r.filterStackByName(stackName)
+		if len(stacks) == 0 {
+			return
+		}
+		groups, err := deploy.BuildGraph(stacks)
+		if err != nil {
+			r.logger.Error("force reconcile graph failed", "error", err)
+			return
+		}
+		commitHash := r.poller.LastHash()
+		if err := r.deployGroups(bgCtx, groups, commitHash); err != nil && !errors.Is(err, ErrRolledBack) {
+			r.logger.Error("force reconcile failed", "error", err)
+		}
+		r.status.Update(time.Now(), commitHash)
+	}()
+
+	return id, nil
+}
+
+// TriggerReconcileAll triggers an async reconcile for all configured stacks.
+// Returns a unique reconcile ID. The actual deploy runs in a background goroutine.
+func (r *Reconciler) TriggerReconcileAll(ctx context.Context) (string, error) {
+	id := "rec-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	// Use a detached context — the caller's context (HTTP request) will be
+	// cancelled when the handler returns, but the background deploy must continue.
+	bgCtx := context.WithoutCancel(ctx)
+
+	go func() {
+		r.logger.Info("force reconcile all triggered", "id", id)
+		if _, err := r.poller.Fetch(); err != nil {
+			r.logger.Error("force reconcile fetch failed", "error", err)
+			return
+		}
+		if err := r.deployAll(bgCtx); err != nil {
+			r.logger.Error("force reconcile deploy failed", "error", err)
+		}
+		r.status.Update(time.Now(), r.poller.LastHash())
+	}()
+
+	return id, nil
+}
+
+// filterStackByName returns deploy stacks for a single named config stack.
+func (r *Reconciler) filterStackByName(name string) []deploy.Stack {
+	for _, cs := range r.hostStacks {
+		if cs.Name == name {
+			return r.configToDeployStacks([]config.Stack{cs})
+		}
+	}
+	return nil
+}
+
+// emit sends an event to the EventBus. It is a no-op when eventBus is nil.
+func (r *Reconciler) emit(eventType notify.EventType, stack, commit, msg string) {
+	if r.eventBus == nil {
+		return
+	}
+	r.eventBus.Emit(notify.Event{
+		Type:      eventType,
+		Timestamp: time.Now(),
+		Stack:     stack,
+		Host:      r.hostname,
+		Commit:    commit,
+		Message:   msg,
+	})
 }

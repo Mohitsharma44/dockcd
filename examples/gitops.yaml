@@ -1,13 +1,32 @@
 repo: git@github.com:user/infra.git
 base_path: /opt/stacks
+branch: main
+
+notifications:
+  - name: slack-alerts
+    type: slack
+    url: "${SLACK_WEBHOOK_URL}"
+    events:
+      - deploy_success
+      - deploy_failure
+      - rollback_success
+      - rollback_failure
+
 hosts:
   server01:
     stacks:
       - name: monitoring
         path: monitoring/
+        hooks:
+          pre_deploy:
+            command: "sops-decrypt.sh"
+            timeout: 15s
       - name: app
         path: app/
         depends_on: [monitoring]
         post_deploy_delay: 30s
         health_check_timeout: 90s
         auto_rollback: true
+        hooks:
+          pre_deploy:
+            command: "sops-decrypt.sh"

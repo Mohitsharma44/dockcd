@@ -8,23 +8,79 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
-	Repo     string                `yaml:"repo"`
-	BasePath string                `yaml:"base_path"`
-	Hosts    map[string]HostConfig `yaml:"hosts"`
+// validNotificationTypes holds the accepted notification backend types.
+var validNotificationTypes = map[string]bool{
+	"slack":   true,
+	"webhook": true,
 }
 
+// validEventTypes holds the accepted event names for notifications.
+var validEventTypes = map[string]bool{
+	"deploy_success":     true,
+	"deploy_failure":     true,
+	"rollback_success":   true,
+	"rollback_failure":   true,
+	"reconcile_start":    true,
+	"reconcile_complete": true,
+	"force_deploy":       true,
+	"stack_suspended":    true,
+	"stack_resumed":      true,
+	"hook_failure":       true,
+}
+
+// HookConfig describes a single lifecycle hook.
+type HookConfig struct {
+	Command string        `yaml:"command"`
+	Timeout time.Duration `yaml:"timeout"`
+}
+
+// Hooks groups the pre- and post-deploy hooks for a stack.
+type Hooks struct {
+	PreDeploy  *HookConfig `yaml:"pre_deploy"`
+	PostDeploy *HookConfig `yaml:"post_deploy"`
+}
+
+// NotificationConfig describes a single notification target.
+type NotificationConfig struct {
+	Name   string   `yaml:"name"`
+	Type   string   `yaml:"type"`
+	URL    string   `yaml:"url"`
+	Events []string `yaml:"events"`
+}
+
+// Config is the top-level configuration for dockcd.
+type Config struct {
+	Repo          string                `yaml:"repo"`
+	BasePath      string                `yaml:"base_path"`
+	Branch        string                `yaml:"branch"`
+	Notifications []NotificationConfig  `yaml:"notifications"`
+	Hosts         map[string]HostConfig `yaml:"hosts"`
+}
+
+// HostConfig holds the list of stacks for a single host.
 type HostConfig struct {
 	Stacks []Stack `yaml:"stacks"`
 }
 
+// Stack describes a single Docker Compose stack managed by dockcd.
 type Stack struct {
 	Name               string         `yaml:"name"`
 	Path               string         `yaml:"path"`
+	Branch             string         `yaml:"branch"`
 	DependsOn          []string       `yaml:"depends_on"`
 	PostDeployDelay    time.Duration  `yaml:"post_deploy_delay"`
 	HealthCheckTimeout *time.Duration `yaml:"health_check_timeout"`
 	AutoRollback       *bool          `yaml:"auto_rollback"`
+	Hooks              *Hooks         `yaml:"hooks"`
+}
+
+// EffectiveBranch returns the branch this stack tracks.
+// Falls back to defaultBranch if not explicitly set.
+func (s *Stack) EffectiveBranch(defaultBranch string) string {
+	if s.Branch != "" {
+		return s.Branch
+	}
+	return defaultBranch
 }
 
 // RollbackEnabled returns whether auto-rollback is enabled for this stack.
@@ -47,20 +103,33 @@ func (s *Stack) HealthTimeout() time.Duration {
 
 func (s *Stack) UnmarshalYAML(value *yaml.Node) error {
 	var raw struct {
-		Name               string   `yaml:"name"`
-		Path               string   `yaml:"path"`
+		Name               string `yaml:"name"`
+		Path               string `yaml:"path"`
+		Branch             string `yaml:"branch"`
 		DependsOn          []string `yaml:"depends_on"`
 		PostDeployDelay    string   `yaml:"post_deploy_delay"`
 		HealthCheckTimeout string   `yaml:"health_check_timeout"`
 		AutoRollback       *bool    `yaml:"auto_rollback"`
+		Hooks              *struct {
+			PreDeploy  *struct {
+				Command string `yaml:"command"`
+				Timeout string `yaml:"timeout"`
+			} `yaml:"pre_deploy"`
+			PostDeploy *struct {
+				Command string `yaml:"command"`
+				Timeout string `yaml:"timeout"`
+			} `yaml:"post_deploy"`
+		} `yaml:"hooks"`
 	}
 	if err := value.Decode(&raw); err != nil {
 		return err
 	}
 	s.Name = raw.Name
 	s.Path = raw.Path
+	s.Branch = raw.Branch
 	s.DependsOn = raw.DependsOn
 	s.AutoRollback = raw.AutoRollback
+
 	if raw.PostDeployDelay != "" {
 		d, err := time.ParseDuration(raw.PostDeployDelay)
 		if err != nil {
@@ -76,19 +145,50 @@ func (s *Stack) UnmarshalYAML(value *yaml.Node) error {
 		timeout := d
 		s.HealthCheckTimeout = &timeout
 	}
+
+	if raw.Hooks != nil {
+		s.Hooks = &Hooks{}
+		if raw.Hooks.PreDeploy != nil {
+			hc := &HookConfig{Command: raw.Hooks.PreDeploy.Command}
+			if raw.Hooks.PreDeploy.Timeout != "" {
+				d, err := time.ParseDuration(raw.Hooks.PreDeploy.Timeout)
+				if err != nil {
+					return fmt.Errorf("invalid pre_deploy hook timeout %q for stack %q: %w", raw.Hooks.PreDeploy.Timeout, raw.Name, err)
+				}
+				hc.Timeout = d
+			}
+			s.Hooks.PreDeploy = hc
+		}
+		if raw.Hooks.PostDeploy != nil {
+			hc := &HookConfig{Command: raw.Hooks.PostDeploy.Command}
+			if raw.Hooks.PostDeploy.Timeout != "" {
+				d, err := time.ParseDuration(raw.Hooks.PostDeploy.Timeout)
+				if err != nil {
+					return fmt.Errorf("invalid post_deploy hook timeout %q for stack %q: %w", raw.Hooks.PostDeploy.Timeout, raw.Name, err)
+				}
+				hc.Timeout = d
+			}
+			s.Hooks.PostDeploy = hc
+		}
+	}
+
 	return nil
 }
 
 var ErrCycleDetected = fmt.Errorf("dependency cycle detected")
 
+// Load reads, env-expands, parses, and validates the config at path.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config file: %w", err)
 	}
 
+	// Expand ${VAR} and $VAR references before YAML parsing.
+	expanded := os.ExpandEnv(string(data))
+
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file: %w", err)
 	}
 
@@ -120,6 +220,14 @@ func validate(cfg *Config) error {
 			if st.Path == "" {
 				return fmt.Errorf("host %q: stack %q path is required", hostName, st.Name)
 			}
+			if st.Hooks != nil {
+				if st.Hooks.PreDeploy != nil && st.Hooks.PreDeploy.Command == "" {
+					return fmt.Errorf("host %q: stack %q: pre_deploy hook command must not be empty", hostName, st.Name)
+				}
+				if st.Hooks.PostDeploy != nil && st.Hooks.PostDeploy.Command == "" {
+					return fmt.Errorf("host %q: stack %q: post_deploy hook command must not be empty", hostName, st.Name)
+				}
+			}
 			stackNames[st.Name] = true
 		}
 		for _, st := range host.Stacks {
@@ -134,6 +242,21 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("host %q: %w", hostName, err)
 		}
 	}
+
+	for i, n := range cfg.Notifications {
+		if !validNotificationTypes[n.Type] {
+			return fmt.Errorf("notification %d (%q): invalid notification type %q", i, n.Name, n.Type)
+		}
+		if n.URL == "" {
+			return fmt.Errorf("notification %d (%q): notification URL must not be empty", i, n.Name)
+		}
+		for _, ev := range n.Events {
+			if !validEventTypes[ev] {
+				return fmt.Errorf("notification %d (%q): invalid notification event %q", i, n.Name, ev)
+			}
+		}
+	}
+
 	return nil
 }
 

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/mohitsharma44/dockcd/internal/hooks"
 )
 
 func containsArg(args []string, target string) bool {
@@ -38,7 +40,7 @@ func TestRunGroupsSequentialOrder(t *testing.T) {
 		{{Name: "c", Path: "c/"}},
 	}
 
-	err := RunGroups(context.Background(), groups, "/opt/repo", fakeRunner)
+	err := RunGroups(context.Background(), groups, "/opt/repo", fakeRunner, hooks.Env{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -79,7 +81,7 @@ func TestRunGroupsParallelWithinGroup(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- RunGroups(context.Background(), groups, "/opt/repo", fakeRunner)
+		done <- RunGroups(context.Background(), groups, "/opt/repo", fakeRunner, hooks.Env{})
 	}()
 
 	// Both should signal "started" since they're parallel.
@@ -117,7 +119,7 @@ func TestRunGroupsStopsOnError(t *testing.T) {
 		{{Name: "b", Path: "b/"}}, // should never run
 	}
 
-	err := RunGroups(context.Background(), groups, "/opt/repo", fakeRunner)
+	err := RunGroups(context.Background(), groups, "/opt/repo", fakeRunner, hooks.Env{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
