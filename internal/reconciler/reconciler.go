@@ -16,6 +16,7 @@ import (
 
 	"github.com/mohitsharma44/dockcd/internal/config"
 	"github.com/mohitsharma44/dockcd/internal/deploy"
+	"github.com/mohitsharma44/dockcd/internal/hooks"
 	"github.com/mohitsharma44/dockcd/internal/metrics"
 	"github.com/mohitsharma44/dockcd/internal/server"
 )
@@ -274,7 +275,13 @@ func (r *Reconciler) deployGroups(ctx context.Context, groups [][]deploy.Stack, 
 
 // deployStack deploys a single stack, health-checks it, and rolls back on failure.
 func (r *Reconciler) deployStack(ctx context.Context, stack deploy.Stack, commitHash string) error {
-	if err := deploy.Deploy(ctx, stack, r.repoDir, r.runner); err != nil {
+	env := hooks.Env{
+		StackName: stack.Name,
+		Commit:    commitHash,
+		RepoDir:   r.repoDir,
+		Branch:    "", // populated by multi-branch later
+	}
+	if err := deploy.Deploy(ctx, stack, r.repoDir, r.runner, env); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
 		return err
 	}
@@ -338,8 +345,13 @@ func (r *Reconciler) rollback(ctx context.Context, stack deploy.Stack, currentCo
 	}
 
 	// Deploy from temp dir using a stack with path "." since files are at root.
+	// No hooks on rollback deploys — hooks only run on forward deploys.
 	rollbackStack := deploy.Stack{Name: stack.Name, Path: "."}
-	if err := deploy.Deploy(ctx, rollbackStack, tmpDir, r.runner); err != nil {
+	if err := deploy.Deploy(ctx, rollbackStack, tmpDir, r.runner, hooks.Env{
+		StackName: stack.Name,
+		Commit:    lastGood,
+		RepoDir:   r.repoDir,
+	}); err != nil {
 		r.markStackHealth(ctx, stack.Name, false)
 		r.recordRollbackMetric(ctx, stack.Name, "failure")
 		return fmt.Errorf("rollback deploy failed for %q: %w", stack.Name, err)
@@ -378,6 +390,15 @@ func (r *Reconciler) buildStackPaths() map[string]string {
 	return paths
 }
 
+// configHookToDeployHook converts a config.HookConfig to a hooks.Config.
+// Returns nil if h is nil.
+func configHookToDeployHook(h *config.HookConfig) *hooks.Config {
+	if h == nil {
+		return nil
+	}
+	return &hooks.Config{Command: h.Command, Timeout: h.Timeout}
+}
+
 // filterChangedStacks converts config stacks to deploy stacks, including
 // only those in changedNames. Dependencies not in the changed set are
 // stripped since they're already deployed and running.
@@ -403,12 +424,19 @@ func (r *Reconciler) filterChangedStacks(changedNames []string) []deploy.Stack {
 				deps = append(deps, d)
 			}
 		}
+		var preHook, postHook *hooks.Config
+		if cs.Hooks != nil {
+			preHook = configHookToDeployHook(cs.Hooks.PreDeploy)
+			postHook = configHookToDeployHook(cs.Hooks.PostDeploy)
+		}
 		stacks = append(stacks, deploy.Stack{
 			Name:               cs.Name,
 			Path:               filepath.Join(r.basePath, cs.Path),
 			DependsOn:          deps,
 			HealthCheckTimeout: cs.HealthTimeout(),
 			AutoRollback:       cs.RollbackEnabled(),
+			PreDeployHook:      preHook,
+			PostDeployHook:     postHook,
 		})
 	}
 	return stacks
@@ -418,12 +446,19 @@ func (r *Reconciler) filterChangedStacks(changedNames []string) []deploy.Stack {
 func (r *Reconciler) configToDeployStacks(configStacks []config.Stack) []deploy.Stack {
 	stacks := make([]deploy.Stack, len(configStacks))
 	for i, cs := range configStacks {
+		var preHook, postHook *hooks.Config
+		if cs.Hooks != nil {
+			preHook = configHookToDeployHook(cs.Hooks.PreDeploy)
+			postHook = configHookToDeployHook(cs.Hooks.PostDeploy)
+		}
 		stacks[i] = deploy.Stack{
 			Name:               cs.Name,
 			Path:               filepath.Join(r.basePath, cs.Path),
 			DependsOn:          cs.DependsOn,
 			HealthCheckTimeout: cs.HealthTimeout(),
 			AutoRollback:       cs.RollbackEnabled(),
+			PreDeployHook:      preHook,
+			PostDeployHook:     postHook,
 		}
 	}
 	return stacks

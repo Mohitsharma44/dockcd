@@ -3,6 +3,8 @@ package deploy
 import (
 	"fmt"
 	"time"
+
+	"github.com/mohitsharma44/dockcd/internal/hooks"
 )
 
 // ErrCycleDetected is returned when stacks have circular dependencies.
@@ -16,6 +18,8 @@ type Stack struct {
 	DependsOn          []string
 	HealthCheckTimeout time.Duration
 	AutoRollback       bool
+	PreDeployHook      *hooks.Config
+	PostDeployHook     *hooks.Config
 }
 
 // BuildGraph takes a list of stacks and returns parallel deployment groups
